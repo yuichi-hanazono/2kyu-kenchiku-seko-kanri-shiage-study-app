@@ -1,0 +1,15 @@
+node_modules/
+dist/
+
+# 教材原本・OCR結果・取り込み結果は公開リポジトリへ置かない
+*.pdf
+pdf-intake-output/
+data/private/
+private-data/
+ocr-output/
+
+# ローカル環境・一時ファイル
+.env
+.env.*
+!.env.example
+*.log
