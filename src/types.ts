@@ -1,10 +1,24 @@
 export type Rating = 'good' | 'unsure' | 'weak';
 export type QuizResult = 'correct' | 'incorrect';
 
+export type QuestionCitationRole =
+  | 'question'
+  | 'choice'
+  | 'answer'
+  | 'publisher_reference_answer'
+  | 'explanation'
+  | 'figure_or_table'
+  | 'other';
+
+export type QuestionExtractionMethod = 'pdfjs_text_layer' | 'tesseract_js_ocr' | 'manual_transcription';
+
 export type QuestionSourceCitation = {
   pdfPage: number;
   printedPageLabel?: string | null;
-  role: string;
+  role: QuestionCitationRole;
+  quote: string;
+  extractionMethod: QuestionExtractionMethod;
+  reviewStatus: 'verified';
 };
 
 export type QuestionSource = {
@@ -12,23 +26,84 @@ export type QuestionSource = {
   citations: QuestionSourceCitation[];
 };
 
-export type Question = {
+export type OfficialAnswerSource = {
+  issuer: string;
+  url: string;
+  reference: string;
+  checkedAt: string;
+  keyOption: number;
+};
+
+export type PublisherReferenceAnswer = {
+  text: string;
+  publisher: string;
+  reference: string;
+  source: QuestionSource;
+};
+
+export type QuestionBase = {
   id: string;
   sourceLabel: string;
   title: string;
   category: string;
   prompt: string;
-  answer: string;
-  explanation: string;
-  choices: string[];
-  correctChoice: number;
+  explanation?: string;
   year?: number;
   examSection?: string;
   specialty?: string;
   questionNumber?: string;
+  contentKind?: string;
+  distribution?: 'private_only';
+  reviewedAt?: string;
   reviewStatus?: string;
   source?: QuestionSource;
 };
+
+/** questionType is optional only for the app's existing display-only sample cards. */
+export type MultipleChoiceQuestion = QuestionBase & {
+  questionType?: 'multiple_choice';
+  answer: string;
+  explanation: string;
+  choices: string[];
+  correctChoice: number;
+  answerVerification?: 'official_key_verified';
+  officialAnswerSource?: OfficialAnswerSource;
+};
+
+export type WrittenQuestion = QuestionBase & {
+  questionType: 'written';
+  publisher_reference_answer: PublisherReferenceAnswer;
+  requiredKeywords?: string[];
+  answer?: never;
+  choices?: never;
+  correctChoice?: never;
+  answerVerification?: never;
+  officialAnswerSource?: never;
+};
+
+export type Question = MultipleChoiceQuestion | WrittenQuestion;
+
+export type VerifiedQuestionBase = QuestionBase & {
+  year: number;
+  examSection: '第二次検定';
+  specialty: '仕上げ';
+  questionNumber: string;
+  contentKind: 'official_past_question';
+  distribution: 'private_only';
+  reviewedAt: string;
+  reviewStatus: 'verified';
+  source: QuestionSource;
+};
+
+export type VerifiedMultipleChoiceQuestion = MultipleChoiceQuestion & VerifiedQuestionBase & {
+  questionType: 'multiple_choice';
+  answerVerification: 'official_key_verified';
+  officialAnswerSource: OfficialAnswerSource;
+};
+
+export type VerifiedWrittenQuestion = WrittenQuestion & VerifiedQuestionBase;
+
+export type VerifiedQuestion = VerifiedMultipleChoiceQuestion | VerifiedWrittenQuestion;
 
 export type QuestionProgress = {
   firstStudyCount: number;

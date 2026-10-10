@@ -2,7 +2,17 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import sampleQuestions from '../data/sample/questions.json';
 import { loadQuestionBank, loadStudyState, makeBackup, progressFor, readBackup, saveQuestionBank, saveStudyState } from './storage';
 import { validateQuestionBank } from './questionBank';
-import { EMPTY_STATE, type Question, type QuestionProgress, type Rating, type StudyState } from './types';
+import {
+  EMPTY_PROGRESS,
+  EMPTY_STATE,
+  type MultipleChoiceQuestion,
+  type Question,
+  type QuestionProgress,
+  type QuestionSource,
+  type Rating,
+  type StudyState,
+  type WrittenQuestion,
+} from './types';
 
 type Page = 'home' | 'today' | 'first' | 'memory' | 'quiz' | 'written' | 'difficult';
 
@@ -55,13 +65,29 @@ function totalStudyCount(progress: QuestionProgress): number {
   return progress.firstStudyCount + progress.memoryTestCount + progress.quizTestCount + progress.writtenTestCount + progress.legacyAttempts;
 }
 
+function isWrittenQuestion(question: Question): question is WrittenQuestion {
+  return question.questionType === 'written';
+}
+
+function isMultipleChoiceQuestion(question: Question): question is MultipleChoiceQuestion {
+  return !isWrittenQuestion(question);
+}
+
+function sourcePageText(source: QuestionSource): string {
+  const pages = [...new Set(source.citations.map((citation) => citation.pdfPage))].sort((a, b) => a - b);
+  return pages.length ? `PDF p.${pages.join(', ')}` : 'PDFページ未設定';
+}
+
 function questionSourceText(question: Question): string | null {
   if (!question.source) return null;
-  const pages = [...new Set(question.source.citations.map((citation) => citation.pdfPage))].sort((a, b) => a - b);
-  const pageText = pages.length ? `PDF p.${pages.join(', ')}` : 'PDFページ未設定';
   const yearText = question.year ? `${question.year}年度` : '';
   const numberText = question.questionNumber ? `問${question.questionNumber}` : '';
-  return `出典：${[yearText, numberText, pageText].filter(Boolean).join(' / ')}（非公開・確認済み）`;
+  return `出典：${[yearText, numberText, sourcePageText(question.source)].filter(Boolean).join(' / ')}（非公開・確認済み）`;
+}
+
+function publisherReferenceSourceText(question: WrittenQuestion): string {
+  const answer = question.publisher_reference_answer;
+  return `出典：${answer.publisher} / ${answer.reference} / ${answer.source.document.fileName} / ${sourcePageText(answer.source)}`;
 }
 
 function withRating(progress: QuestionProgress, rating: Rating): QuestionProgress {
@@ -95,19 +121,24 @@ function App() {
   const today = localDateKey();
   const allProgress = useMemo(
     () => questions.map((question) => progressFor(studyState, question.id)),
-    [studyState],
+    [questions, studyState],
   );
   const studiedToday = useMemo(
     () => questions.filter((question) => progressFor(studyState, question.id).lastStudiedOn === today),
-    [studyState, today],
+    [questions, studyState, today],
   );
   const difficultQuestions = useMemo(
     () => questions.filter((question) => progressFor(studyState, question.id).isDifficult),
-    [studyState],
+    [questions, studyState],
   );
+  const pageQuestions = useMemo(() => {
+    if (page === 'quiz') return questions.filter(isMultipleChoiceQuestion);
+    if (page === 'written') return questions.filter(isWrittenQuestion);
+    return questions;
+  }, [page, questions]);
   const studiedQuestionCount = allProgress.filter((progress) => totalStudyCount(progress) > 0).length;
-  const currentQuestion = questions[questionIndex % questions.length];
-  const currentProgress = progressFor(studyState, currentQuestion.id);
+  const currentQuestion = pageQuestions.length ? pageQuestions[questionIndex % pageQuestions.length] : undefined;
+  const currentProgress = currentQuestion ? progressFor(studyState, currentQuestion.id) : EMPTY_PROGRESS;
 
   useEffect(() => {
     let active = true;
@@ -155,7 +186,8 @@ function App() {
   }
 
   function moveQuestion(direction: -1 | 1) {
-    setQuestionIndex((index) => (index + direction + questions.length) % questions.length);
+    if (pageQuestions.length === 0) return;
+    setQuestionIndex((index) => (index + direction + pageQuestions.length) % pageQuestions.length);
     setAnswerVisible(false);
     setSelectedChoice(null);
     setWrittenAnswer('');
@@ -273,11 +305,11 @@ function App() {
     }
   }
 
-  function handleChoice(choiceIndex: number) {
+  function handleChoice(question: MultipleChoiceQuestion, choiceIndex: number) {
     if (selectedChoice !== null) return;
-    const isCorrect = choiceIndex === currentQuestion.correctChoice;
+    const isCorrect = choiceIndex === question.correctChoice;
     setSelectedChoice(choiceIndex);
-    updateProgress(currentQuestion.id, (previous) => withRating({
+    updateProgress(question.id, (previous) => withRating({
       ...previous,
       quizTestCount: previous.quizTestCount + 1,
       quizCorrectCount: previous.quizCorrectCount + (isCorrect ? 1 : 0),
@@ -298,12 +330,7 @@ function App() {
         {questionSourceText(question) && <span className="muted-small">{questionSourceText(question)}</span>}
         <h3>{question.title}</h3>
         <p className="question-card__prompt">{question.prompt}</p>
-        <div className="question-card__answer">
-          <span className="eyebrow">解答</span>
-          <p>{question.answer}</p>
-          <span className="eyebrow">解説</span>
-          <p>{question.explanation}</p>
-        </div>
+        {renderAnswerContent(question, 'question-card__answer')}
         <div className="question-card__footer">
           <span className="muted-small">学習回数 {totalStudyCount(progress)}回{progress.legacyAttempts > 0 ? '（旧記録含む）' : ''}</span>
           {progress.nextReviewOn && <span className="muted-small">次回復習 {progress.nextReviewOn}</span>}
@@ -312,6 +339,28 @@ function App() {
           </button>
         </div>
       </article>
+    );
+  }
+
+  function renderAnswerContent(question: Question, className = 'revealed-answer') {
+    if (isWrittenQuestion(question)) {
+      return (
+        <div className={className}>
+          <span className="eyebrow">出版社参考答案</span>
+          <p>{question.publisher_reference_answer.text}</p>
+          <p className="muted-small">出版社資料に基づく参考答案です。公式正答ではありません。</p>
+          <p className="muted-small">{publisherReferenceSourceText(question)}</p>
+          {question.explanation && <><span className="eyebrow">解説</span><p>{question.explanation}</p></>}
+        </div>
+      );
+    }
+    return (
+      <div className={className}>
+        <span className="eyebrow">解答</span>
+        <p>{question.answer}</p>
+        <span className="eyebrow">解説</span>
+        <p>{question.explanation}</p>
+      </div>
     );
   }
 
@@ -377,10 +426,15 @@ function App() {
   }
 
   function renderStudyMode() {
+    if (!currentQuestion) {
+      const isWrittenPage = page === 'written';
+      return <section className="empty-state"><span className="empty-state__icon">{isWrittenPage ? '✎' : '☷'}</span><h2>{isWrittenPage ? '記述式問題はまだありません' : '問題がありません'}</h2><p>{isWrittenPage ? '非公開の問題バンクを読み込むと、記述式問題がここに表示されます。' : '問題バンクを読み込むと、この画面で演習できます。'}</p></section>;
+    }
+
     if (page === 'first') {
       return <>
         <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--blue">▤</span><div><span className="eyebrow">FIRST LEARNING</span><h2>まずは解答・解説を読んでみましょう</h2><p>このモードでは正誤判定を行いません。自分のペースで読み進められます。</p></div></div>
-        <div className="question-position"><span>問題 {questionIndex + 1}<small> / {questions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / questions.length) * 100}%` }} /></span></div>
+        <div className="question-position"><span>問題 {questionIndex + 1}<small> / {pageQuestions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / pageQuestions.length) * 100}%` }} /></span></div>
         {renderQuestionCard(currentQuestion)}
         <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => { recordFirstStudy(currentQuestion.id); moveQuestion(1); }}>読んだので次へ <span>→</span></button></div>
       </>;
@@ -389,28 +443,31 @@ function App() {
     if (page === 'memory') {
       return <>
         <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--mint">◇</span><div><span className="eyebrow">MEMORY CHECK</span><h2>思い出せるか、確認してみましょう</h2><p>解答を見たあと、今の手応えを○△×で記録できます。</p></div></div>
-        <div className="question-position"><span>問題 {questionIndex + 1}<small> / {questions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / questions.length) * 100}%` }} /></span></div>
-        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2>{answerVisible ? <div className="revealed-answer"><span className="eyebrow">解答</span><p>{currentQuestion.answer}</p><span className="eyebrow">解説</span><p>{currentQuestion.explanation}</p></div> : <button className="button button--primary button--wide" onClick={() => setAnswerVisible(true)}>解答・解説を見る</button>}</article>
+        <div className="question-position"><span>問題 {questionIndex + 1}<small> / {pageQuestions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / pageQuestions.length) * 100}%` }} /></span></div>
+        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2>{answerVisible ? renderAnswerContent(currentQuestion) : <button className="button button--primary button--wide" onClick={() => setAnswerVisible(true)}>解答・解説を見る</button>}</article>
         {answerVisible && <section className="rating-panel"><div><strong>どのくらい思い出せましたか？</strong><small>手応えと次回復習日を記録します。</small></div><div className="rating-buttons">{ratingOptions.map((option) => <button key={option.value} className={`rating-button rating-button--${option.tone}${currentProgress.rating === option.value ? ' is-selected' : ''}`} onClick={() => handleRating(currentQuestion.id, option.value)}><strong>{option.symbol}</strong><span>{option.label}</span></button>)}</div></section>}
         <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => moveQuestion(1)}>次の問題 <span>→</span></button></div>
       </>;
     }
 
     if (page === 'quiz') {
+      if (!isMultipleChoiceQuestion(currentQuestion)) return null;
       return <>
         <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--peach">☷</span><div><span className="eyebrow">MULTIPLE CHOICE</span><h2>選択肢を選んで答えましょう</h2><p>選ぶと正誤と解説が表示されます。</p></div></div>
-        <div className="question-position"><span>問題 {questionIndex + 1}<small> / {questions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / questions.length) * 100}%` }} /></span></div>
-        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><div className="choice-list">{currentQuestion.choices.map((choice, index) => { const isCorrect = index === currentQuestion.correctChoice; const isSelected = selectedChoice === index; const stateClass = selectedChoice === null ? '' : isCorrect ? ' choice-button--correct' : isSelected ? ' choice-button--incorrect' : ' choice-button--muted'; return <button key={choice} className={`choice-button${stateClass}`} onClick={() => handleChoice(index)} disabled={selectedChoice !== null}><span>{String.fromCharCode(65 + index)}</span>{choice}{selectedChoice !== null && isCorrect && <b>正解</b>}</button>; })}</div>{selectedChoice !== null && <div className={`quiz-feedback${selectedChoice === currentQuestion.correctChoice ? ' quiz-feedback--correct' : ' quiz-feedback--incorrect'}`}><strong>{selectedChoice === currentQuestion.correctChoice ? '正解です' : '今回は不正解'}</strong><p>{currentQuestion.explanation}</p><small>正答：{currentQuestion.choices[currentQuestion.correctChoice]}</small></div>}</article>
+        <div className="question-position"><span>問題 {questionIndex + 1}<small> / {pageQuestions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / pageQuestions.length) * 100}%` }} /></span></div>
+        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><div className="choice-list">{currentQuestion.choices.map((choice, index) => { const isCorrect = index === currentQuestion.correctChoice; const isSelected = selectedChoice === index; const stateClass = selectedChoice === null ? '' : isCorrect ? ' choice-button--correct' : isSelected ? ' choice-button--incorrect' : ' choice-button--muted'; return <button key={choice} className={`choice-button${stateClass}`} onClick={() => handleChoice(currentQuestion, index)} disabled={selectedChoice !== null}><span>{String.fromCharCode(65 + index)}</span>{choice}{selectedChoice !== null && isCorrect && <b>正解</b>}</button>; })}</div>{selectedChoice !== null && <div className={`quiz-feedback${selectedChoice === currentQuestion.correctChoice ? ' quiz-feedback--correct' : ' quiz-feedback--incorrect'}`}><strong>{selectedChoice === currentQuestion.correctChoice ? '正解です' : '今回は不正解'}</strong><p>{currentQuestion.explanation}</p><small>正答：{currentQuestion.choices[currentQuestion.correctChoice]}</small></div>}</article>
         <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => moveQuestion(1)}>次の問題 <span>→</span></button></div>
       </>;
     }
 
+    if (page !== 'written' || !isWrittenQuestion(currentQuestion)) return null;
+    const missingKeywords = (currentQuestion.requiredKeywords ?? []).filter((keyword) => !writtenAnswer.includes(keyword));
     return <>
-      <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--lavender">✎</span><div><span className="eyebrow">WRITTEN RECALL</span><h2>思い出した内容を書いてみましょう</h2><p>書いたあとに解答例を表示し、自分で見比べます。</p></div></div>
-      <section className="ai-note"><span className="ai-note__icon">AI</span><p><strong>AI採点は未実装です</strong><br />入力内容は自動採点・送信されません。解答例と見比べて自己確認してください。</p></section>
-      <div className="question-position"><span>問題 {questionIndex + 1}<small> / {questions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / questions.length) * 100}%` }} /></span></div>
-      <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><label className="answer-label" htmlFor="written-answer">自分の回答</label><textarea id="written-answer" className="answer-input" placeholder="思い出した内容を入力してください…" value={writtenAnswer} onChange={(event) => setWrittenAnswer(event.target.value)} rows={5} />{writtenRevealed ? <div className="revealed-answer"><span className="eyebrow">解答例</span><p>{currentQuestion.answer}</p><span className="eyebrow">解説</span><p>{currentQuestion.explanation}</p></div> : <button className="button button--primary button--wide" onClick={() => { setWrittenRevealed(true); recordWrittenTest(currentQuestion.id); }}>解答例と見比べる</button>}</article>
-      {writtenRevealed && <section className="rating-panel"><div><strong>自分で確認</strong><small>自動採点ではありません。見比べた感覚を記録できます。</small></div><div className="rating-buttons">{ratingOptions.map((option) => <button key={option.value} className={`rating-button rating-button--${option.tone}${currentProgress.rating === option.value ? ' is-selected' : ''}`} onClick={() => handleRating(currentQuestion.id, option.value)}><strong>{option.symbol}</strong><span>{option.label}</span></button>)}</div></section>}
+      <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--lavender">✎</span><div><span className="eyebrow">WRITTEN RECALL</span><h2>思い出した内容を書いてみましょう</h2><p>書いたあとに出版社参考答案と見比べ、自分で記録できます。</p></div></div>
+      <section className="ai-note"><span className="ai-note__icon">自分</span><p><strong>答案は自分で確認します</strong><br />入力内容の自動判定は行わず、出版社参考答案と見比べた手応えを記録します。</p></section>
+      <div className="question-position"><span>問題 {questionIndex + 1}<small> / {pageQuestions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / pageQuestions.length) * 100}%` }} /></span></div>
+      <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><label className="answer-label" htmlFor="written-answer">自分の回答</label><textarea id="written-answer" className="answer-input" placeholder="思い出した内容を入力してください…" value={writtenAnswer} onChange={(event) => setWrittenAnswer(event.target.value)} rows={5} />{writtenRevealed ? <>{renderAnswerContent(currentQuestion)}{currentQuestion.requiredKeywords && <div className="question-card__answer"><span className="eyebrow">回答内で見つからないキーワード</span><p>{missingKeywords.length ? missingKeywords.join('、') : '設定されたキーワードは回答内にすべて見つかりました。'}</p><p className="muted-small">入力文との単純な文字列照合です。正誤や採点の判定ではありません。</p></div>}</> : <button className="button button--primary button--wide" onClick={() => { setWrittenRevealed(true); recordWrittenTest(currentQuestion.id); }}>出版社参考答案を見る</button>}</article>
+      {writtenRevealed && <section className="rating-panel"><div><strong>自分で確認</strong><small>見比べた手応えを○△×で記録します。</small></div><div className="rating-buttons">{ratingOptions.map((option) => <button key={option.value} className={`rating-button rating-button--${option.tone}${currentProgress.rating === option.value ? ' is-selected' : ''}`} onClick={() => handleRating(currentQuestion.id, option.value)}><strong>{option.symbol}</strong><span>{option.label}</span></button>)}</div></section>}
       <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => moveQuestion(1)}>次の問題 <span>→</span></button></div>
     </>;
   }

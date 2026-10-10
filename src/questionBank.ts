@@ -1,40 +1,10 @@
-import type { Question } from './types';
-
-type CitationRole = 'question' | 'choice' | 'answer' | 'explanation' | 'figure_or_table' | 'other';
-type ExtractionMethod = 'pdfjs_text_layer' | 'tesseract_js_ocr' | 'manual_transcription';
-
-export type QuestionCitation = {
-  pdfPage: number;
-  printedPageLabel?: string | null;
-  role: CitationRole;
-  quote: string;
-  extractionMethod: ExtractionMethod;
-  reviewStatus: 'verified';
-};
-
-export type VerifiedQuestion = Question & {
-  year: number;
-  examSection: '第二次検定';
-  specialty: '仕上げ';
-  questionNumber: string;
-  contentKind: 'official_past_question';
-  answerVerification: 'official_key_verified';
-  distribution: 'private_only';
-  reviewedAt: string;
-  questionType: 'multiple_choice';
-  reviewStatus: 'verified';
-  officialAnswerSource: {
-    issuer: string;
-    url: string;
-    reference: string;
-    checkedAt: string;
-    keyOption: number;
-  };
-  source: {
-    document: { fileName: string; sha256: string };
-    citations: QuestionCitation[];
-  };
-};
+import type {
+  QuestionCitationRole,
+  QuestionExtractionMethod,
+  QuestionSource,
+  QuestionSourceCitation,
+  VerifiedQuestion,
+} from './types';
 
 export type QuestionBank = {
   app: 'building-management-study-app';
@@ -76,69 +46,30 @@ function isIsoDateTime(value: unknown): value is string {
   return true;
 }
 
-function validateQuestion(value: unknown, index: number): VerifiedQuestion {
-  const path = `questions[${index}]`;
-  if (!isRecord(value)) invalid(path, 'オブジェクトではありません。');
-
-  for (const field of ['id', 'sourceLabel', 'title', 'category', 'prompt', 'answer'] as const) {
-    if (!isNonEmptyString(value[field])) invalid(`${path}.${field}`, '必須の文字列です。');
-  }
-  if (!Number.isSafeInteger(value.year) || (value.year as number) < 1) invalid(`${path}.year`, '1以上の整数が必要です。');
-  if (value.examSection !== '第二次検定') invalid(`${path}.examSection`, '第二次検定のみ取り込めます。');
-  if (value.specialty !== '仕上げ') invalid(`${path}.specialty`, '仕上げのみ取り込めます。');
-  if (!isNonEmptyString(value.questionNumber)) invalid(`${path}.questionNumber`, '必須の文字列です。');
-  if (value.contentKind !== 'official_past_question') invalid(`${path}.contentKind`, 'official_past_question のみ取り込めます。');
-  if (value.answerVerification !== 'official_key_verified') invalid(`${path}.answerVerification`, 'official_key_verified の正答のみ取り込めます。');
-  if (value.distribution !== 'private_only') invalid(`${path}.distribution`, 'private_only の問題のみ取り込めます。');
-  if (!isIsoDateTime(value.reviewedAt)) invalid(`${path}.reviewedAt`, '有効なISO日時が必要です。');
-  if (typeof value.explanation !== 'string') invalid(`${path}.explanation`, '文字列が必要です。');
-  if (value.questionType !== 'multiple_choice') invalid(`${path}.questionType`, 'multiple_choice のみ取り込めます。');
-  if (value.reviewStatus !== 'verified') invalid(`${path}.reviewStatus`, 'verified の問題のみ取り込めます。');
-  if (!isRecord(value.officialAnswerSource)) invalid(`${path}.officialAnswerSource`, '公式正答の根拠が必要です。');
-  for (const field of ['issuer', 'url', 'reference', 'checkedAt'] as const) {
-    if (!isNonEmptyString(value.officialAnswerSource[field])) {
-      invalid(`${path}.officialAnswerSource.${field}`, '必須の文字列です。');
-    }
-  }
-  if (!/^https:\/\/www\.fcip-shiken\.jp\//u.test(value.officialAnswerSource.url as string)) {
-    invalid(`${path}.officialAnswerSource.url`, '公式試験実施機関のHTTPS URLが必要です。');
-  }
-  if (!isIsoDateTime(value.officialAnswerSource.checkedAt)) {
-    invalid(`${path}.officialAnswerSource.checkedAt`, '有効なISO日時が必要です。');
-  }
-  if (!Number.isSafeInteger(value.officialAnswerSource.keyOption) || (value.officialAnswerSource.keyOption as number) < 1 || (value.officialAnswerSource.keyOption as number) > 4) {
-    invalid(`${path}.officialAnswerSource.keyOption`, '1から4までの公式選択肢番号が必要です。');
-  }
-  if (!Array.isArray(value.choices) || value.choices.length !== 4 || !value.choices.every(isNonEmptyString)) {
-    invalid(`${path}.choices`, '空でない選択肢が4件必要です。');
-  }
-  if (!Number.isSafeInteger(value.correctChoice) || (value.correctChoice as number) < 0 || (value.correctChoice as number) >= 4) {
-    invalid(`${path}.correctChoice`, '選択肢の範囲内の整数が必要です。');
-  }
-
-  if (!isRecord(value.source) || !isRecord(value.source.document)) {
-    invalid(`${path}.source`, '出典と資料情報が必要です。');
-  }
-  const document = value.source.document;
-  if (!isNonEmptyString(document.fileName)) invalid(`${path}.source.document.fileName`, '必須の文字列です。');
+function validateSource(value: unknown, path: string, requiredRoles: QuestionCitationRole[]): QuestionSource {
+  if (!isRecord(value) || !isRecord(value.document)) invalid(path, '出典と資料情報が必要です。');
+  const document = value.document;
+  if (!isNonEmptyString(document.fileName)) invalid(`${path}.document.fileName`, '必須の文字列です。');
   if (typeof document.sha256 !== 'string' || !/^[a-f\d]{64}$/iu.test(document.sha256)) {
-    invalid(`${path}.source.document.sha256`, '64桁のSHA-256値が必要です。');
+    invalid(`${path}.document.sha256`, '64桁のSHA-256値が必要です。');
   }
-  if (!Array.isArray(value.source.citations) || value.source.citations.length === 0) {
-    invalid(`${path}.source.citations`, '出典ページが1件以上必要です。');
+  if (!Array.isArray(value.citations) || value.citations.length === 0) {
+    invalid(`${path}.citations`, '出典ページが1件以上必要です。');
   }
 
-  const allowedRoles: CitationRole[] = ['question', 'choice', 'answer', 'explanation', 'figure_or_table', 'other'];
-  const allowedMethods: ExtractionMethod[] = ['pdfjs_text_layer', 'tesseract_js_ocr', 'manual_transcription'];
-  const citations = value.source.citations.map((candidate, citationIndex): QuestionCitation => {
-    const citationPath = `${path}.source.citations[${citationIndex}]`;
+  const allowedRoles: QuestionCitationRole[] = [
+    'question', 'choice', 'answer', 'publisher_reference_answer', 'explanation', 'figure_or_table', 'other',
+  ];
+  const allowedMethods: QuestionExtractionMethod[] = ['pdfjs_text_layer', 'tesseract_js_ocr', 'manual_transcription'];
+  const citations = value.citations.map((candidate, citationIndex): QuestionSourceCitation => {
+    const citationPath = `${path}.citations[${citationIndex}]`;
     if (!isRecord(candidate)) invalid(citationPath, 'オブジェクトではありません。');
     if (!Number.isSafeInteger(candidate.pdfPage) || (candidate.pdfPage as number) < 1) {
       invalid(`${citationPath}.pdfPage`, '1以上のPDFページ番号が必要です。');
     }
-    if (!allowedRoles.includes(candidate.role as CitationRole)) invalid(`${citationPath}.role`, '出典の役割が不正です。');
+    if (!allowedRoles.includes(candidate.role as QuestionCitationRole)) invalid(`${citationPath}.role`, '出典の役割が不正です。');
     if (typeof candidate.quote !== 'string') invalid(`${citationPath}.quote`, '文字列が必要です。');
-    if (!allowedMethods.includes(candidate.extractionMethod as ExtractionMethod)) {
+    if (!allowedMethods.includes(candidate.extractionMethod as QuestionExtractionMethod)) {
       invalid(`${citationPath}.extractionMethod`, '抽出方法が不正です。');
     }
     if (candidate.reviewStatus !== 'verified') invalid(`${citationPath}.reviewStatus`, '確認済みの出典ページが必要です。');
@@ -149,21 +80,51 @@ function validateQuestion(value: unknown, index: number): VerifiedQuestion {
     return {
       pdfPage: candidate.pdfPage as number,
       ...(candidate.printedPageLabel !== undefined ? { printedPageLabel: candidate.printedPageLabel as string | null } : {}),
-      role: candidate.role as CitationRole,
+      role: candidate.role as QuestionCitationRole,
       quote: candidate.quote,
-      extractionMethod: candidate.extractionMethod as ExtractionMethod,
+      extractionMethod: candidate.extractionMethod as QuestionExtractionMethod,
       reviewStatus: 'verified',
     };
   });
 
-  if (!citations.some((citation) => citation.role === 'question')) {
-    invalid(`${path}.source.citations`, '問題文の根拠ページが必要です。');
-  }
-  for (const requiredRole of ['choice', 'answer'] as const) {
+  for (const requiredRole of requiredRoles) {
     if (!citations.some((citation) => citation.role === requiredRole)) {
-      invalid(`${path}.source.citations`, `${requiredRole}の根拠ページが必要です。`);
+      invalid(`${path}.citations`, `${requiredRole}の根拠ページが必要です。`);
     }
   }
+
+  return {
+    document: { fileName: document.fileName as string, sha256: document.sha256 },
+    citations,
+  };
+}
+
+function validateCommonQuestion(value: Record<string, unknown>, path: string): {
+  id: string;
+  sourceLabel: string;
+  title: string;
+  category: string;
+  prompt: string;
+  year: number;
+  examSection: '第二次検定';
+  specialty: '仕上げ';
+  questionNumber: string;
+  contentKind: 'official_past_question';
+  distribution: 'private_only';
+  reviewedAt: string;
+  reviewStatus: 'verified';
+} {
+  for (const field of ['id', 'sourceLabel', 'title', 'category', 'prompt'] as const) {
+    if (!isNonEmptyString(value[field])) invalid(`${path}.${field}`, '必須の文字列です。');
+  }
+  if (!Number.isSafeInteger(value.year) || (value.year as number) < 1) invalid(`${path}.year`, '1以上の整数が必要です。');
+  if (value.examSection !== '第二次検定') invalid(`${path}.examSection`, '第二次検定のみ取り込めます。');
+  if (value.specialty !== '仕上げ') invalid(`${path}.specialty`, '仕上げのみ取り込めます。');
+  if (!isNonEmptyString(value.questionNumber)) invalid(`${path}.questionNumber`, '必須の文字列です。');
+  if (value.contentKind !== 'official_past_question') invalid(`${path}.contentKind`, 'official_past_question のみ取り込めます。');
+  if (value.distribution !== 'private_only') invalid(`${path}.distribution`, 'private_only の問題のみ取り込めます。');
+  if (!isIsoDateTime(value.reviewedAt)) invalid(`${path}.reviewedAt`, '有効なISO日時が必要です。');
+  if (value.reviewStatus !== 'verified') invalid(`${path}.reviewStatus`, 'verified の問題のみ取り込めます。');
 
   return {
     id: value.id as string,
@@ -171,32 +132,125 @@ function validateQuestion(value: unknown, index: number): VerifiedQuestion {
     title: value.title as string,
     category: value.category as string,
     prompt: value.prompt as string,
-    answer: value.answer as string,
-    explanation: value.explanation,
-    choices: value.choices as string[],
-    correctChoice: value.correctChoice as number,
     year: value.year as number,
     examSection: '第二次検定',
     specialty: '仕上げ',
     questionNumber: value.questionNumber as string,
     contentKind: 'official_past_question',
-    answerVerification: 'official_key_verified',
     distribution: 'private_only',
     reviewedAt: value.reviewedAt,
-    questionType: 'multiple_choice',
     reviewStatus: 'verified',
-    officialAnswerSource: {
-      issuer: value.officialAnswerSource.issuer as string,
-      url: value.officialAnswerSource.url as string,
-      reference: value.officialAnswerSource.reference as string,
-      checkedAt: value.officialAnswerSource.checkedAt as string,
-      keyOption: value.officialAnswerSource.keyOption as number,
-    },
-    source: {
-      document: { fileName: document.fileName as string, sha256: document.sha256 },
-      citations,
-    },
   };
+}
+
+function validateOfficialAnswerSource(value: unknown, path: string) {
+  if (!isRecord(value)) invalid(path, '公式正答の根拠が必要です。');
+  for (const field of ['issuer', 'url', 'reference', 'checkedAt'] as const) {
+    if (!isNonEmptyString(value[field])) invalid(`${path}.${field}`, '必須の文字列です。');
+  }
+  if (!/^https:\/\/www\.fcip-shiken\.jp\//u.test(value.url as string)) {
+    invalid(`${path}.url`, '公式試験実施機関のHTTPS URLが必要です。');
+  }
+  if (!isIsoDateTime(value.checkedAt)) invalid(`${path}.checkedAt`, '有効なISO日時が必要です。');
+  if (!Number.isSafeInteger(value.keyOption) || (value.keyOption as number) < 1 || (value.keyOption as number) > 4) {
+    invalid(`${path}.keyOption`, '1から4までの公式選択肢番号が必要です。');
+  }
+  return {
+    issuer: value.issuer as string,
+    url: value.url as string,
+    reference: value.reference as string,
+    checkedAt: value.checkedAt as string,
+    keyOption: value.keyOption as number,
+  };
+}
+
+function validateMultipleChoiceQuestion(value: Record<string, unknown>, index: number): VerifiedQuestion {
+  const path = `questions[${index}]`;
+  const common = validateCommonQuestion(value, path);
+  if (value.questionType !== 'multiple_choice') invalid(`${path}.questionType`, 'questionType が不正です。');
+  if ('publisher_reference_answer' in value || 'requiredKeywords' in value) {
+    invalid(path, '記述式専用フィールドは multiple_choice に指定できません。');
+  }
+  if (!isNonEmptyString(value.answer)) invalid(`${path}.answer`, '必須の文字列です。');
+  if (typeof value.explanation !== 'string') invalid(`${path}.explanation`, '文字列が必要です。');
+  if (value.answerVerification !== 'official_key_verified') {
+    invalid(`${path}.answerVerification`, 'official_key_verified の正答のみ取り込めます。');
+  }
+  const officialAnswerSource = validateOfficialAnswerSource(value.officialAnswerSource, `${path}.officialAnswerSource`);
+  if (!Array.isArray(value.choices) || value.choices.length !== 4 || !value.choices.every(isNonEmptyString)) {
+    invalid(`${path}.choices`, '空でない選択肢が4件必要です。');
+  }
+  if (!Number.isSafeInteger(value.correctChoice) || (value.correctChoice as number) < 0 || (value.correctChoice as number) >= 4) {
+    invalid(`${path}.correctChoice`, '選択肢の範囲内の整数が必要です。');
+  }
+
+  return {
+    ...common,
+    explanation: value.explanation,
+    choices: value.choices as string[],
+    correctChoice: value.correctChoice as number,
+    answer: value.answer as string,
+    answerVerification: 'official_key_verified',
+    distribution: 'private_only',
+    questionType: 'multiple_choice',
+    officialAnswerSource,
+    source: validateSource(value.source, `${path}.source`, ['question', 'choice', 'answer']),
+  };
+}
+
+function validateWrittenQuestion(value: Record<string, unknown>, index: number): VerifiedQuestion {
+  const path = `questions[${index}]`;
+  const common = validateCommonQuestion(value, path);
+  if (value.questionType !== 'written') invalid(`${path}.questionType`, 'questionType が不正です。');
+  for (const field of ['answer', 'choices', 'correctChoice', 'answerVerification', 'officialAnswerSource'] as const) {
+    if (field in value) invalid(`${path}.${field}`, '記述式には公式正答・4択用フィールドを指定できません。');
+  }
+  if (value.explanation !== undefined && typeof value.explanation !== 'string') {
+    invalid(`${path}.explanation`, '文字列が必要です。');
+  }
+
+  const reference = value.publisher_reference_answer;
+  if (!isRecord(reference)) invalid(`${path}.publisher_reference_answer`, '出版社参考答案が必要です。');
+  for (const field of ['text', 'publisher', 'reference'] as const) {
+    if (!isNonEmptyString(reference[field])) {
+      invalid(`${path}.publisher_reference_answer.${field}`, '必須の文字列です。');
+    }
+  }
+  const referenceSource = validateSource(
+    reference.source,
+    `${path}.publisher_reference_answer.source`,
+    ['publisher_reference_answer'],
+  );
+
+  let requiredKeywords: string[] | undefined;
+  if (value.requiredKeywords !== undefined) {
+    if (!Array.isArray(value.requiredKeywords) || value.requiredKeywords.length === 0 || !value.requiredKeywords.every(isNonEmptyString)) {
+      invalid(`${path}.requiredKeywords`, '空でないキーワードが1件以上必要です。');
+    }
+    requiredKeywords = value.requiredKeywords as string[];
+  }
+
+  return {
+    ...common,
+    ...(value.explanation !== undefined ? { explanation: value.explanation } : {}),
+    questionType: 'written',
+    publisher_reference_answer: {
+      text: reference.text as string,
+      publisher: reference.publisher as string,
+      reference: reference.reference as string,
+      source: referenceSource,
+    },
+    ...(requiredKeywords ? { requiredKeywords } : {}),
+    source: validateSource(value.source, `${path}.source`, ['question']),
+  };
+}
+
+function validateQuestion(value: unknown, index: number): VerifiedQuestion {
+  const path = `questions[${index}]`;
+  if (!isRecord(value)) invalid(path, 'オブジェクトではありません。');
+  if (value.questionType === 'multiple_choice') return validateMultipleChoiceQuestion(value, index);
+  if (value.questionType === 'written') return validateWrittenQuestion(value, index);
+  invalid(`${path}.questionType`, 'multiple_choice または written が必要です。');
 }
 
 export function validateQuestionBank(value: unknown): QuestionBank {
