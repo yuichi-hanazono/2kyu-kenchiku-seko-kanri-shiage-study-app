@@ -41,6 +41,12 @@ export type PublisherReferenceAnswer = {
   source: QuestionSource;
 };
 
+export type PublisherReferenceSource = {
+  publisher: string;
+  reference: string;
+  source: QuestionSource;
+};
+
 export type QuestionBase = {
   id: string;
   sourceLabel: string;
@@ -59,16 +65,33 @@ export type QuestionBase = {
   source?: QuestionSource;
 };
 
-/** questionType is optional only for the app's existing display-only sample cards. */
-export type MultipleChoiceQuestion = QuestionBase & {
+type MultipleChoiceQuestionFields = QuestionBase & {
   questionType?: 'multiple_choice';
   answer: string;
   explanation: string;
   choices: string[];
   correctChoice: number;
-  answerVerification?: 'official_key_verified';
-  officialAnswerSource?: OfficialAnswerSource;
 };
+
+type MultipleChoiceAnswerEvidence =
+  | {
+      answerVerification?: undefined;
+      officialAnswerSource?: never;
+      publisherReferenceSource?: never;
+    }
+  | {
+      answerVerification: 'official_key_verified';
+      officialAnswerSource: OfficialAnswerSource;
+      publisherReferenceSource?: never;
+    }
+  | {
+      answerVerification: 'publisher_reference_only';
+      officialAnswerSource?: never;
+      publisherReferenceSource: PublisherReferenceSource;
+    };
+
+/** questionType and evidence are optional only for the app's display-only sample cards. */
+export type MultipleChoiceQuestion = MultipleChoiceQuestionFields & MultipleChoiceAnswerEvidence;
 
 export type WrittenQuestion = QuestionBase & {
   questionType: 'written';
@@ -79,6 +102,7 @@ export type WrittenQuestion = QuestionBase & {
   correctChoice?: never;
   answerVerification?: never;
   officialAnswerSource?: never;
+  publisherReferenceSource?: never;
 };
 
 export type Question = MultipleChoiceQuestion | WrittenQuestion;
@@ -95,11 +119,20 @@ export type VerifiedQuestionBase = QuestionBase & {
   source: QuestionSource;
 };
 
-export type VerifiedMultipleChoiceQuestion = MultipleChoiceQuestion & VerifiedQuestionBase & {
+export type VerifiedMultipleChoiceQuestion = Omit<MultipleChoiceQuestionFields, 'source'> & VerifiedQuestionBase & {
   questionType: 'multiple_choice';
-  answerVerification: 'official_key_verified';
-  officialAnswerSource: OfficialAnswerSource;
-};
+} & (
+  | {
+      answerVerification: 'official_key_verified';
+      officialAnswerSource: OfficialAnswerSource;
+      publisherReferenceSource?: never;
+    }
+  | {
+      answerVerification: 'publisher_reference_only';
+      officialAnswerSource?: never;
+      publisherReferenceSource: PublisherReferenceSource;
+    }
+);
 
 export type VerifiedWrittenQuestion = WrittenQuestion & VerifiedQuestionBase;
 

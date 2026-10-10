@@ -9,12 +9,14 @@ import {
   type Question,
   type QuestionProgress,
   type QuestionSource,
+  type PublisherReferenceSource,
   type Rating,
   type StudyState,
   type WrittenQuestion,
 } from './types';
 
 type Page = 'home' | 'today' | 'first' | 'memory' | 'quiz' | 'written' | 'difficult';
+type LearningPage = 'first' | 'memory' | 'quiz' | 'written';
 
 const sampleQuestionList = sampleQuestions as Question[];
 
@@ -73,6 +75,22 @@ function isMultipleChoiceQuestion(question: Question): question is MultipleChoic
   return !isWrittenQuestion(question);
 }
 
+function isLearningPage(page: Page): page is LearningPage {
+  return page === 'first' || page === 'memory' || page === 'quiz' || page === 'written';
+}
+
+function questionNumberValue(question: Question): string | null {
+  const rawValue = question.questionNumber?.normalize('NFKC').trim();
+  if (!rawValue) return null;
+
+  const value = rawValue
+    .replace(/^(?:問題|問|第)\s*/u, '')
+    .replace(/\s*(?:問題|問)$/u, '')
+    .replace(/\s+/gu, '')
+    .toUpperCase();
+  return value || null;
+}
+
 function sourcePageText(source: QuestionSource): string {
   const pages = [...new Set(source.citations.map((citation) => citation.pdfPage))].sort((a, b) => a - b);
   return pages.length ? `PDF p.${pages.join(', ')}` : 'PDFページ未設定';
@@ -88,6 +106,42 @@ function questionSourceText(question: Question): string | null {
 function publisherReferenceSourceText(question: WrittenQuestion): string {
   const answer = question.publisher_reference_answer;
   return `出典：${answer.publisher} / ${answer.reference} / ${answer.source.document.fileName} / ${sourcePageText(answer.source)}`;
+}
+
+function publisherMultipleChoiceSourceText(source: PublisherReferenceSource): string {
+  return `出典：${source.publisher} / ${source.reference} / ${source.source.document.fileName} / ${sourcePageText(source.source)}`;
+}
+
+function multipleChoiceAnswerEvidence(question: MultipleChoiceQuestion) {
+  if (question.answerVerification === 'official_key_verified') {
+    return {
+      kind: 'official' as const,
+      label: '公式正答（照合済み）',
+      note: '試験実施機関が公表した正答と照合済みです。',
+      source: `出典：${question.officialAnswerSource.issuer} / ${question.officialAnswerSource.reference} / ${question.officialAnswerSource.url}`,
+    };
+  }
+  if (question.answerVerification === 'publisher_reference_only') {
+    return {
+      kind: 'publisher' as const,
+      label: '出版社参考答案（学習上の正答）',
+      note: '出版社の参考答案を学習上の正答として採用しています。公式正答とは照合していません。',
+      source: publisherMultipleChoiceSourceText(question.publisherReferenceSource),
+    };
+  }
+  return {
+    kind: 'unknown' as const,
+    label: '解答',
+    note: '',
+    source: null,
+  };
+}
+
+function multipleChoiceQuizResultLabel(question: MultipleChoiceQuestion, isCorrect: boolean): string {
+  const evidence = multipleChoiceAnswerEvidence(question);
+  if (evidence.kind === 'publisher') return isCorrect ? '出版社参考答案と一致しました' : '出版社参考答案と異なります';
+  if (evidence.kind === 'official') return isCorrect ? '公式正答と一致しました' : '公式正答と異なります';
+  return isCorrect ? '登録された解答と一致しました' : '登録された解答と異なります';
 }
 
 function withRating(progress: QuestionProgress, rating: Rating): QuestionProgress {
@@ -108,6 +162,7 @@ function App() {
   const [stateCanBeSaved, setStateCanBeSaved] = useState(false);
   const [storageMessage, setStorageMessage] = useState('');
   const [questionIndex, setQuestionIndex] = useState(0);
+  const [questionNumberFilters, setQuestionNumberFilters] = useState<Partial<Record<LearningPage, string[]>>>({});
   const [answerVisible, setAnswerVisible] = useState(false);
   const [selectedChoice, setSelectedChoice] = useState<number | null>(null);
   const [writtenAnswer, setWrittenAnswer] = useState('');
@@ -131,11 +186,26 @@ function App() {
     () => questions.filter((question) => progressFor(studyState, question.id).isDifficult),
     [questions, studyState],
   );
-  const pageQuestions = useMemo(() => {
+  const modeQuestions = useMemo(() => {
     if (page === 'quiz') return questions.filter(isMultipleChoiceQuestion);
     if (page === 'written') return questions.filter(isWrittenQuestion);
     return questions;
   }, [page, questions]);
+  const questionNumberOptions = useMemo(
+    () => [...new Set(modeQuestions.map(questionNumberValue).filter((value): value is string => value !== null))]
+      .sort((left, right) => left.localeCompare(right, 'ja', { numeric: true, sensitivity: 'base' })),
+    [modeQuestions],
+  );
+  const activeLearningPage = isLearningPage(page) ? page : null;
+  const selectedQuestionNumbers = activeLearningPage ? questionNumberFilters[activeLearningPage] ?? [] : [];
+  const pageQuestions = useMemo(() => {
+    if (!activeLearningPage || selectedQuestionNumbers.length === 0) return modeQuestions;
+    const selectedNumbers = new Set(selectedQuestionNumbers);
+    return modeQuestions.filter((question) => {
+      const value = questionNumberValue(question);
+      return value !== null && selectedNumbers.has(value);
+    });
+  }, [activeLearningPage, modeQuestions, selectedQuestionNumbers]);
   const studiedQuestionCount = allProgress.filter((progress) => totalStudyCount(progress) > 0).length;
   const currentQuestion = pageQuestions.length ? pageQuestions[questionIndex % pageQuestions.length] : undefined;
   const currentProgress = currentQuestion ? progressFor(studyState, currentQuestion.id) : EMPTY_PROGRESS;
@@ -183,6 +253,33 @@ function App() {
     setWrittenAnswer('');
     setWrittenRevealed(false);
     memoryRatingRecorded.current = false;
+  }
+
+  function resetQuestionInteraction() {
+    setQuestionIndex(0);
+    setAnswerVisible(false);
+    setSelectedChoice(null);
+    setWrittenAnswer('');
+    setWrittenRevealed(false);
+    memoryRatingRecorded.current = false;
+  }
+
+  function toggleQuestionNumber(number: string) {
+    if (!activeLearningPage) return;
+    setQuestionNumberFilters((current) => {
+      const selected = current[activeLearningPage] ?? [];
+      const next = selected.includes(number)
+        ? selected.filter((value) => value !== number)
+        : [...selected, number];
+      return { ...current, [activeLearningPage]: next };
+    });
+    resetQuestionInteraction();
+  }
+
+  function resetQuestionNumberFilter() {
+    if (!activeLearningPage) return;
+    setQuestionNumberFilters((current) => ({ ...current, [activeLearningPage]: [] }));
+    resetQuestionInteraction();
   }
 
   function moveQuestion(direction: -1 | 1) {
@@ -291,6 +388,7 @@ function App() {
 
       await saveQuestionBank(bank);
       setQuestions(bank.questions);
+      setQuestionNumberFilters({});
       setIsPrivateQuestionBankLoaded(true);
       changePage('home');
       setStorageMessage(
@@ -354,10 +452,18 @@ function App() {
         </div>
       );
     }
+    const evidence = multipleChoiceAnswerEvidence(question);
     return (
       <div className={className}>
-        <span className="eyebrow">解答</span>
+        <span className="eyebrow">{evidence.label}</span>
         <p>{question.answer}</p>
+        {evidence.kind !== 'unknown' && (
+          <div className={`answer-evidence answer-evidence--${evidence.kind}`} role="note">
+            <strong>{evidence.label}</strong>
+            <p>{evidence.note}</p>
+            <small>{evidence.source}</small>
+          </div>
+        )}
         <span className="eyebrow">解説</span>
         <p>{question.explanation}</p>
       </div>
@@ -428,12 +534,13 @@ function App() {
   function renderStudyMode() {
     if (!currentQuestion) {
       const isWrittenPage = page === 'written';
-      return <section className="empty-state"><span className="empty-state__icon">{isWrittenPage ? '✎' : '☷'}</span><h2>{isWrittenPage ? '記述式問題はまだありません' : '問題がありません'}</h2><p>{isWrittenPage ? '非公開の問題バンクを読み込むと、記述式問題がここに表示されます。' : '問題バンクを読み込むと、この画面で演習できます。'}</p></section>;
+      return <>{renderQuestionNumberFilter()}<section className="empty-state"><span className="empty-state__icon">{isWrittenPage ? '✎' : '☷'}</span><h2>{isWrittenPage ? '記述式問題はまだありません' : '問題がありません'}</h2><p>{isWrittenPage ? '非公開の問題バンクを読み込むと、記述式問題がここに表示されます。' : '問題バンクを読み込むと、この画面で演習できます。'}</p></section></>;
     }
 
     if (page === 'first') {
       return <>
         <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--blue">▤</span><div><span className="eyebrow">FIRST LEARNING</span><h2>まずは解答・解説を読んでみましょう</h2><p>このモードでは正誤判定を行いません。自分のペースで読み進められます。</p></div></div>
+        {renderQuestionNumberFilter()}
         <div className="question-position"><span>問題 {questionIndex + 1}<small> / {pageQuestions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / pageQuestions.length) * 100}%` }} /></span></div>
         {renderQuestionCard(currentQuestion)}
         <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => { recordFirstStudy(currentQuestion.id); moveQuestion(1); }}>読んだので次へ <span>→</span></button></div>
@@ -443,6 +550,7 @@ function App() {
     if (page === 'memory') {
       return <>
         <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--mint">◇</span><div><span className="eyebrow">MEMORY CHECK</span><h2>思い出せるか、確認してみましょう</h2><p>解答を見たあと、今の手応えを○△×で記録できます。</p></div></div>
+        {renderQuestionNumberFilter()}
         <div className="question-position"><span>問題 {questionIndex + 1}<small> / {pageQuestions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / pageQuestions.length) * 100}%` }} /></span></div>
         <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2>{answerVisible ? renderAnswerContent(currentQuestion) : <button className="button button--primary button--wide" onClick={() => setAnswerVisible(true)}>解答・解説を見る</button>}</article>
         {answerVisible && <section className="rating-panel"><div><strong>どのくらい思い出せましたか？</strong><small>手応えと次回復習日を記録します。</small></div><div className="rating-buttons">{ratingOptions.map((option) => <button key={option.value} className={`rating-button rating-button--${option.tone}${currentProgress.rating === option.value ? ' is-selected' : ''}`} onClick={() => handleRating(currentQuestion.id, option.value)}><strong>{option.symbol}</strong><span>{option.label}</span></button>)}</div></section>}
@@ -454,8 +562,42 @@ function App() {
       if (!isMultipleChoiceQuestion(currentQuestion)) return null;
       return <>
         <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--peach">☷</span><div><span className="eyebrow">MULTIPLE CHOICE</span><h2>選択肢を選んで答えましょう</h2><p>選ぶと正誤と解説が表示されます。</p></div></div>
+        {renderQuestionNumberFilter()}
         <div className="question-position"><span>問題 {questionIndex + 1}<small> / {pageQuestions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / pageQuestions.length) * 100}%` }} /></span></div>
-        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><div className="choice-list">{currentQuestion.choices.map((choice, index) => { const isCorrect = index === currentQuestion.correctChoice; const isSelected = selectedChoice === index; const stateClass = selectedChoice === null ? '' : isCorrect ? ' choice-button--correct' : isSelected ? ' choice-button--incorrect' : ' choice-button--muted'; return <button key={choice} className={`choice-button${stateClass}`} onClick={() => handleChoice(currentQuestion, index)} disabled={selectedChoice !== null}><span>{String.fromCharCode(65 + index)}</span>{choice}{selectedChoice !== null && isCorrect && <b>正解</b>}</button>; })}</div>{selectedChoice !== null && <div className={`quiz-feedback${selectedChoice === currentQuestion.correctChoice ? ' quiz-feedback--correct' : ' quiz-feedback--incorrect'}`}><strong>{selectedChoice === currentQuestion.correctChoice ? '正解です' : '今回は不正解'}</strong><p>{currentQuestion.explanation}</p><small>正答：{currentQuestion.choices[currentQuestion.correctChoice]}</small></div>}</article>
+        <article className="study-card">
+          <div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>
+          {questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}
+          <span className="eyebrow">QUESTION</span>
+          <h2 className="study-card__prompt">{currentQuestion.prompt}</h2>
+          <div className="choice-list">
+            {currentQuestion.choices.map((choice, index) => {
+              const isCorrect = index === currentQuestion.correctChoice;
+              const isSelected = selectedChoice === index;
+              const stateClass = selectedChoice === null ? '' : isCorrect ? ' choice-button--correct' : isSelected ? ' choice-button--incorrect' : ' choice-button--muted';
+              const evidenceLabel = currentQuestion.answerVerification === 'publisher_reference_only'
+                ? '参考答案'
+                : currentQuestion.answerVerification === 'official_key_verified' ? '公式正答' : '登録解答';
+              return (
+                <button key={choice} className={`choice-button${stateClass}`} onClick={() => handleChoice(currentQuestion, index)} disabled={selectedChoice !== null}>
+                  <span>{String.fromCharCode(65 + index)}</span>{choice}{selectedChoice !== null && isCorrect && <b>{evidenceLabel}</b>}
+                </button>
+              );
+            })}
+          </div>
+          {selectedChoice !== null && (() => {
+            const isCorrect = selectedChoice === currentQuestion.correctChoice;
+            const evidence = multipleChoiceAnswerEvidence(currentQuestion);
+            return (
+              <div className={`quiz-feedback${isCorrect ? ' quiz-feedback--correct' : ' quiz-feedback--incorrect'}`}>
+                <strong>{multipleChoiceQuizResultLabel(currentQuestion, isCorrect)}</strong>
+                <p>{currentQuestion.explanation}</p>
+                <small>{evidence.label}：{currentQuestion.choices[currentQuestion.correctChoice]}</small>
+                {evidence.source && <small className="quiz-feedback__source">{evidence.source}</small>}
+                {evidence.note && <small className="quiz-feedback__note">{evidence.note}</small>}
+              </div>
+            );
+          })()}
+        </article>
         <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => moveQuestion(1)}>次の問題 <span>→</span></button></div>
       </>;
     }
@@ -465,6 +607,7 @@ function App() {
     return <>
       <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--lavender">✎</span><div><span className="eyebrow">WRITTEN RECALL</span><h2>思い出した内容を書いてみましょう</h2><p>書いたあとに出版社参考答案と見比べ、自分で記録できます。</p></div></div>
       <section className="ai-note"><span className="ai-note__icon">自分</span><p><strong>答案は自分で確認します</strong><br />入力内容の自動判定は行わず、出版社参考答案と見比べた手応えを記録します。</p></section>
+      {renderQuestionNumberFilter()}
       <div className="question-position"><span>問題 {questionIndex + 1}<small> / {pageQuestions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / pageQuestions.length) * 100}%` }} /></span></div>
       <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><label className="answer-label" htmlFor="written-answer">自分の回答</label><textarea id="written-answer" className="answer-input" placeholder="思い出した内容を入力してください…" value={writtenAnswer} onChange={(event) => setWrittenAnswer(event.target.value)} rows={5} />{writtenRevealed ? <>{renderAnswerContent(currentQuestion)}{currentQuestion.requiredKeywords && <div className="question-card__answer"><span className="eyebrow">回答内で見つからないキーワード</span><p>{missingKeywords.length ? missingKeywords.join('、') : '設定されたキーワードは回答内にすべて見つかりました。'}</p><p className="muted-small">入力文との単純な文字列照合です。正誤や採点の判定ではありません。</p></div>}</> : <button className="button button--primary button--wide" onClick={() => { setWrittenRevealed(true); recordWrittenTest(currentQuestion.id); }}>出版社参考答案を見る</button>}</article>
       {writtenRevealed && <section className="rating-panel"><div><strong>自分で確認</strong><small>見比べた手応えを○△×で記録します。</small></div><div className="rating-buttons">{ratingOptions.map((option) => <button key={option.value} className={`rating-button rating-button--${option.tone}${currentProgress.rating === option.value ? ' is-selected' : ''}`} onClick={() => handleRating(currentQuestion.id, option.value)}><strong>{option.symbol}</strong><span>{option.label}</span></button>)}</div></section>}
@@ -474,6 +617,50 @@ function App() {
 
   function renderDifficult() {
     return difficultQuestions.length ? <div className="difficult-list">{difficultQuestions.map((question) => renderQuestionCard(question, true))}</div> : <section className="empty-state"><span className="empty-state__icon">☆</span><h2>苦手問題はまだありません</h2><p>問題カードの「苦手に追加」または暗記確認の「×」から登録できます。</p><button className="button button--primary" onClick={() => changePage('memory')}>暗記確認をはじめる →</button></section>;
+  }
+
+  function renderQuestionNumberFilter() {
+    return (
+      <section className="question-filter" aria-label="問題番号フィルター">
+        <div className="question-filter__header">
+          <div className="question-filter__summary">
+            <strong>問題番号で絞り込む</strong>
+            <span className="question-filter__count" aria-live="polite">
+              {selectedQuestionNumbers.length > 0 && `${selectedQuestionNumbers.length}種類選択中・`}
+              対象 {pageQuestions.length} / {modeQuestions.length}問
+            </span>
+          </div>
+          <button
+            className="text-button question-filter__reset"
+            type="button"
+            onClick={resetQuestionNumberFilter}
+            disabled={selectedQuestionNumbers.length === 0}
+          >
+            リセット
+          </button>
+        </div>
+        {questionNumberOptions.length > 0 ? (
+          <div className="question-filter__options" role="group" aria-label="問題番号を選択">
+            {questionNumberOptions.map((number) => {
+              const isSelected = selectedQuestionNumbers.includes(number);
+              return (
+                <button
+                  key={number}
+                  className={`question-filter__option${isSelected ? ' is-selected' : ''}`}
+                  type="button"
+                  aria-pressed={isSelected}
+                  onClick={() => toggleQuestionNumber(number)}
+                >
+                  問題{number}
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="question-filter__empty">問題番号付きの問題がありません。絞り込みなしで全問題を表示します。</p>
+        )}
+      </section>
+    );
   }
 
   const currentTitle = pageTitles[page];

@@ -1,4 +1,6 @@
 import type {
+  OfficialAnswerSource,
+  PublisherReferenceSource,
   QuestionCitationRole,
   QuestionExtractionMethod,
   QuestionSource,
@@ -143,7 +145,7 @@ function validateCommonQuestion(value: Record<string, unknown>, path: string): {
   };
 }
 
-function validateOfficialAnswerSource(value: unknown, path: string) {
+function validateOfficialAnswerSource(value: unknown, path: string): OfficialAnswerSource {
   if (!isRecord(value)) invalid(path, '公式正答の根拠が必要です。');
   for (const field of ['issuer', 'url', 'reference', 'checkedAt'] as const) {
     if (!isNonEmptyString(value[field])) invalid(`${path}.${field}`, '必須の文字列です。');
@@ -164,6 +166,18 @@ function validateOfficialAnswerSource(value: unknown, path: string) {
   };
 }
 
+function validatePublisherReferenceSource(value: unknown, path: string): PublisherReferenceSource {
+  if (!isRecord(value)) invalid(path, '出版社参考答案の根拠が必要です。');
+  for (const field of ['publisher', 'reference'] as const) {
+    if (!isNonEmptyString(value[field])) invalid(`${path}.${field}`, '必須の文字列です。');
+  }
+  return {
+    publisher: value.publisher as string,
+    reference: value.reference as string,
+    source: validateSource(value.source, `${path}.source`, ['publisher_reference_answer']),
+  };
+}
+
 function validateMultipleChoiceQuestion(value: Record<string, unknown>, index: number): VerifiedQuestion {
   const path = `questions[${index}]`;
   const common = validateCommonQuestion(value, path);
@@ -173,15 +187,40 @@ function validateMultipleChoiceQuestion(value: Record<string, unknown>, index: n
   }
   if (!isNonEmptyString(value.answer)) invalid(`${path}.answer`, '必須の文字列です。');
   if (typeof value.explanation !== 'string') invalid(`${path}.explanation`, '文字列が必要です。');
-  if (value.answerVerification !== 'official_key_verified') {
-    invalid(`${path}.answerVerification`, 'official_key_verified の正答のみ取り込めます。');
-  }
-  const officialAnswerSource = validateOfficialAnswerSource(value.officialAnswerSource, `${path}.officialAnswerSource`);
   if (!Array.isArray(value.choices) || value.choices.length !== 4 || !value.choices.every(isNonEmptyString)) {
     invalid(`${path}.choices`, '空でない選択肢が4件必要です。');
   }
   if (!Number.isSafeInteger(value.correctChoice) || (value.correctChoice as number) < 0 || (value.correctChoice as number) >= 4) {
     invalid(`${path}.correctChoice`, '選択肢の範囲内の整数が必要です。');
+  }
+
+  let answerEvidence:
+    | { answerVerification: 'official_key_verified'; officialAnswerSource: OfficialAnswerSource }
+    | { answerVerification: 'publisher_reference_only'; publisherReferenceSource: PublisherReferenceSource };
+  let requiredSourceRoles: QuestionCitationRole[];
+  if (value.answerVerification === 'official_key_verified') {
+    if ('publisherReferenceSource' in value) {
+      invalid(`${path}.publisherReferenceSource`, '公式正答の問題に出版社参考答案の出典は指定できません。');
+    }
+    answerEvidence = {
+      answerVerification: 'official_key_verified',
+      officialAnswerSource: validateOfficialAnswerSource(value.officialAnswerSource, `${path}.officialAnswerSource`),
+    };
+    requiredSourceRoles = ['question', 'choice', 'answer'];
+  } else if (value.answerVerification === 'publisher_reference_only') {
+    if ('officialAnswerSource' in value) {
+      invalid(`${path}.officialAnswerSource`, '出版社参考答案のみの問題に公式正答の出典は指定できません。');
+    }
+    answerEvidence = {
+      answerVerification: 'publisher_reference_only',
+      publisherReferenceSource: validatePublisherReferenceSource(
+        value.publisherReferenceSource,
+        `${path}.publisherReferenceSource`,
+      ),
+    };
+    requiredSourceRoles = ['question', 'choice'];
+  } else {
+    invalid(`${path}.answerVerification`, 'official_key_verified または publisher_reference_only が必要です。');
   }
 
   return {
@@ -190,11 +229,10 @@ function validateMultipleChoiceQuestion(value: Record<string, unknown>, index: n
     choices: value.choices as string[],
     correctChoice: value.correctChoice as number,
     answer: value.answer as string,
-    answerVerification: 'official_key_verified',
+    ...answerEvidence,
     distribution: 'private_only',
     questionType: 'multiple_choice',
-    officialAnswerSource,
-    source: validateSource(value.source, `${path}.source`, ['question', 'choice', 'answer']),
+    source: validateSource(value.source, `${path}.source`, requiredSourceRoles),
   };
 }
 
@@ -202,7 +240,7 @@ function validateWrittenQuestion(value: Record<string, unknown>, index: number):
   const path = `questions[${index}]`;
   const common = validateCommonQuestion(value, path);
   if (value.questionType !== 'written') invalid(`${path}.questionType`, 'questionType が不正です。');
-  for (const field of ['answer', 'choices', 'correctChoice', 'answerVerification', 'officialAnswerSource'] as const) {
+  for (const field of ['answer', 'choices', 'correctChoice', 'answerVerification', 'officialAnswerSource', 'publisherReferenceSource'] as const) {
     if (field in value) invalid(`${path}.${field}`, '記述式には公式正答・4択用フィールドを指定できません。');
   }
   if (value.explanation !== undefined && typeof value.explanation !== 'string') {

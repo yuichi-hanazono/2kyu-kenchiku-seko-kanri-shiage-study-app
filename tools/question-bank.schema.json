@@ -37,8 +37,9 @@
           "items": { "type": "string", "minLength": 1 }
         },
         "correctChoice": { "type": "integer", "minimum": 0, "maximum": 3 },
-        "answerVerification": { "const": "official_key_verified" },
+        "answerVerification": { "enum": ["official_key_verified", "publisher_reference_only"] },
         "officialAnswerSource": { "$ref": "#/$defs/officialAnswerSource" },
+        "publisherReferenceSource": { "$ref": "#/$defs/publisherReferenceSource" },
         "year": { "type": "integer", "minimum": 1 },
         "examSection": { "const": "第二次検定" },
         "specialty": { "const": "仕上げ" },
@@ -64,26 +65,56 @@
         {
           "if": { "properties": { "questionType": { "const": "multiple_choice" } }, "required": ["questionType"] },
           "then": {
-            "required": ["answer", "explanation", "choices", "correctChoice", "answerVerification", "officialAnswerSource"],
-            "properties": {
-              "source": {
-                "allOf": [
-                  { "$ref": "#/$defs/source" },
-                  {
-                    "properties": {
-                      "citations": {
-                        "minItems": 3,
-                        "allOf": [
-                          { "contains": { "properties": { "role": { "const": "question" } }, "required": ["role"] } },
-                          { "contains": { "properties": { "role": { "const": "choice" } }, "required": ["role"] } },
-                          { "contains": { "properties": { "role": { "const": "answer" } }, "required": ["role"] } }
-                        ]
+            "required": ["answer", "explanation", "choices", "correctChoice", "answerVerification"],
+            "oneOf": [
+              {
+                "required": ["answerVerification", "officialAnswerSource"],
+                "not": { "required": ["publisherReferenceSource"] },
+                "properties": {
+                  "answerVerification": { "const": "official_key_verified" },
+                  "source": {
+                    "allOf": [
+                      { "$ref": "#/$defs/source" },
+                      {
+                        "properties": {
+                          "citations": {
+                            "minItems": 3,
+                            "allOf": [
+                              { "contains": { "properties": { "role": { "const": "question" } }, "required": ["role"] } },
+                              { "contains": { "properties": { "role": { "const": "choice" } }, "required": ["role"] } },
+                              { "contains": { "properties": { "role": { "const": "answer" } }, "required": ["role"] } }
+                            ]
+                          }
+                        }
                       }
-                    }
+                    ]
                   }
-                ]
+                }
+              },
+              {
+                "required": ["answerVerification", "publisherReferenceSource"],
+                "not": { "required": ["officialAnswerSource"] },
+                "properties": {
+                  "answerVerification": { "const": "publisher_reference_only" },
+                  "source": {
+                    "allOf": [
+                      { "$ref": "#/$defs/source" },
+                      {
+                        "properties": {
+                          "citations": {
+                            "minItems": 2,
+                            "allOf": [
+                              { "contains": { "properties": { "role": { "const": "question" } }, "required": ["role"] } },
+                              { "contains": { "properties": { "role": { "const": "choice" } }, "required": ["role"] } }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
               }
-            },
+            ],
             "not": { "anyOf": [{ "required": ["publisher_reference_answer"] }, { "required": ["requiredKeywords"] }] }
           }
         },
@@ -111,7 +142,8 @@
                 { "required": ["choices"] },
                 { "required": ["correctChoice"] },
                 { "required": ["answerVerification"] },
-                { "required": ["officialAnswerSource"] }
+                { "required": ["officialAnswerSource"] },
+                { "required": ["publisherReferenceSource"] }
               ]
             }
           }
@@ -132,6 +164,27 @@
           "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
         },
         "keyOption": { "type": "integer", "minimum": 1, "maximum": 4, "description": "Official answer option number, 1-based." }
+      }
+    },
+    "publisherReferenceSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["publisher", "reference", "source"],
+      "properties": {
+        "publisher": { "type": "string", "minLength": 1 },
+        "reference": { "type": "string", "minLength": 1 },
+        "source": {
+          "allOf": [
+            { "$ref": "#/$defs/source" },
+            {
+              "properties": {
+                "citations": {
+                  "contains": { "properties": { "role": { "const": "publisher_reference_answer" } }, "required": ["role"] }
+                }
+              }
+            }
+          ]
+        }
       }
     },
     "publisherReferenceAnswer": {
