@@ -1,6 +1,17 @@
 export type Rating = 'good' | 'unsure' | 'weak';
 export type QuizResult = 'correct' | 'incorrect';
 
+export type QuestionSourceCitation = {
+  pdfPage: number;
+  printedPageLabel?: string | null;
+  role: string;
+};
+
+export type QuestionSource = {
+  document: { fileName: string; sha256: string };
+  citations: QuestionSourceCitation[];
+};
+
 export type Question = {
   id: string;
   sourceLabel: string;
@@ -11,6 +22,12 @@ export type Question = {
   explanation: string;
   choices: string[];
   correctChoice: number;
+  year?: number;
+  examSection?: string;
+  specialty?: string;
+  questionNumber?: string;
+  reviewStatus?: string;
+  source?: QuestionSource;
 };
 
 export type QuestionProgress = {

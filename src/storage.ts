@@ -6,11 +6,13 @@ import {
   type Rating,
   type StudyState,
 } from './types';
+import { validateQuestionBank, type QuestionBank } from './questionBank';
 
 const DATABASE_NAME = 'building-management-study-app';
 const DATABASE_VERSION = 1;
 const STORE_NAME = 'app-state';
 const STATE_KEY = 'study-progress';
+const QUESTION_BANK_KEY = 'private-question-bank';
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -118,15 +120,18 @@ function normalizeProgress(value: unknown, version: 1 | 2): QuestionProgress | n
   };
 }
 
-export function normalizeState(value: unknown, questionIds: Set<string>): StudyState {
+export function normalizeState(value: unknown, questionIds: Set<string>, preserveUnmatchedRecords = false): StudyState {
   if (!isObjectRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2) || !isObjectRecord(value.records)) {
     return EMPTY_STATE;
   }
 
   const version = value.schemaVersion;
   const sourceRecords = value.records;
-  const records: StudyState['records'] = {};
-  for (const questionId of questionIds) {
+  const records = Object.create(null) as StudyState['records'];
+  const idsToNormalize = preserveUnmatchedRecords
+    ? new Set([...questionIds, ...Object.keys(sourceRecords)])
+    : questionIds;
+  for (const questionId of idsToNormalize) {
     const normalized = normalizeProgress(sourceRecords[questionId], version);
     if (normalized) records[questionId] = normalized;
   }
@@ -139,11 +144,22 @@ export async function loadStudyState(questionIds: Set<string>): Promise<StudySta
   if (!isObjectRecord(saved) || (saved.schemaVersion !== 1 && saved.schemaVersion !== 2) || !isObjectRecord(saved.records)) {
     throw new Error('保存データ形式を認識できません。既存データは変更していません。');
   }
-  return normalizeState(saved, questionIds);
+  return normalizeState(saved, questionIds, true);
 }
 
 export async function saveStudyState(state: StudyState): Promise<void> {
   await withStore('readwrite', (store) => store.put(state, STATE_KEY));
+}
+
+export async function loadQuestionBank(): Promise<QuestionBank | null> {
+  const saved: unknown = await withStore('readonly', (store) => store.get(QUESTION_BANK_KEY));
+  return saved === undefined ? null : validateQuestionBank(saved);
+}
+
+export async function saveQuestionBank(value: unknown): Promise<QuestionBank> {
+  const bank = validateQuestionBank(value);
+  await withStore('readwrite', (store) => store.put(bank, QUESTION_BANK_KEY));
+  return bank;
 }
 
 export function progressFor(state: StudyState, questionId: string): QuestionProgress {

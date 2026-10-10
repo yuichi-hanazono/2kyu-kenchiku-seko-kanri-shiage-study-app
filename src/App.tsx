@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import sampleQuestions from '../data/sample/questions.json';
-import { loadStudyState, makeBackup, progressFor, readBackup, saveStudyState } from './storage';
+import { loadQuestionBank, loadStudyState, makeBackup, progressFor, readBackup, saveQuestionBank, saveStudyState } from './storage';
+import { validateQuestionBank } from './questionBank';
 import { EMPTY_STATE, type Question, type QuestionProgress, type Rating, type StudyState } from './types';
 
 type Page = 'home' | 'today' | 'first' | 'memory' | 'quiz' | 'written' | 'difficult';
 
-const questions = sampleQuestions as Question[];
-const questionIds = new Set(questions.map((question) => question.id));
+const sampleQuestionList = sampleQuestions as Question[];
 
 const navigation: { id: Page; label: string; symbol: string; group?: string }[] = [
   { id: 'home', label: 'ホーム', symbol: '⌂' },
@@ -55,6 +55,15 @@ function totalStudyCount(progress: QuestionProgress): number {
   return progress.firstStudyCount + progress.memoryTestCount + progress.quizTestCount + progress.writtenTestCount + progress.legacyAttempts;
 }
 
+function questionSourceText(question: Question): string | null {
+  if (!question.source) return null;
+  const pages = [...new Set(question.source.citations.map((citation) => citation.pdfPage))].sort((a, b) => a - b);
+  const pageText = pages.length ? `PDF p.${pages.join(', ')}` : 'PDFページ未設定';
+  const yearText = question.year ? `${question.year}年度` : '';
+  const numberText = question.questionNumber ? `問${question.questionNumber}` : '';
+  return `出典：${[yearText, numberText, pageText].filter(Boolean).join(' / ')}（非公開・確認済み）`;
+}
+
 function withRating(progress: QuestionProgress, rating: Rating): QuestionProgress {
   return {
     ...progress,
@@ -66,6 +75,8 @@ function withRating(progress: QuestionProgress, rating: Rating): QuestionProgres
 
 function App() {
   const [page, setPage] = useState<Page>('home');
+  const [questions, setQuestions] = useState<Question[]>(sampleQuestionList);
+  const [isPrivateQuestionBankLoaded, setIsPrivateQuestionBankLoaded] = useState(false);
   const [studyState, setStudyState] = useState<StudyState>(EMPTY_STATE);
   const [isLoaded, setIsLoaded] = useState(false);
   const [stateCanBeSaved, setStateCanBeSaved] = useState(false);
@@ -77,6 +88,9 @@ function App() {
   const [writtenRevealed, setWrittenRevealed] = useState(false);
   const memoryRatingRecorded = useRef(false);
   const restoreInput = useRef<HTMLInputElement>(null);
+  const questionBankInput = useRef<HTMLInputElement>(null);
+
+  const questionIds = useMemo(() => new Set(questions.map((question) => question.id)), [questions]);
 
   const today = localDateKey();
   const allProgress = useMemo(
@@ -97,19 +111,26 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    loadStudyState(questionIds)
-      .then((saved) => {
+    async function loadAppData() {
+      try {
+        const savedBank = await loadQuestionBank();
+        const initialQuestions = savedBank?.questions ?? sampleQuestionList;
         if (active) {
-          setStudyState(saved);
+          setQuestions(initialQuestions);
+          setIsPrivateQuestionBankLoaded(savedBank !== null);
+        }
+        const savedState = await loadStudyState(new Set(initialQuestions.map((question) => question.id)));
+        if (active) {
+          setStudyState(savedState);
           setStateCanBeSaved(true);
         }
-      })
-      .catch((error: unknown) => {
+      } catch (error: unknown) {
         if (active) setStorageMessage(error instanceof Error ? error.message : '保存データを読み込めませんでした。');
-      })
-      .finally(() => {
+      } finally {
         if (active) setIsLoaded(true);
-      });
+      }
+    }
+    void loadAppData();
     return () => {
       active = false;
     };
@@ -118,7 +139,7 @@ function App() {
   useEffect(() => {
     if (!isLoaded || !stateCanBeSaved) return;
     saveStudyState(studyState).then(
-      () => setStorageMessage(''),
+      () => setStorageMessage((message) => message.startsWith('学習データを保存できません') ? '' : message),
       (error: unknown) => setStorageMessage(error instanceof Error ? error.message : '学習データを保存できませんでした。'),
     );
   }, [isLoaded, stateCanBeSaved, studyState]);
@@ -215,7 +236,7 @@ function App() {
   async function restoreBackup(file: File | undefined) {
     if (!file) return;
     try {
-      const parsed: unknown = JSON.parse(await file.text());
+      const parsed: unknown = JSON.parse((await file.text()).replace(/^\uFEFF/u, ''));
       const restored = readBackup(parsed, questionIds);
       if (!window.confirm('現在の学習データをバックアップの内容に置き換えます。続けますか？')) return;
       await saveStudyState(restored);
@@ -226,6 +247,29 @@ function App() {
       setStorageMessage(error instanceof Error ? error.message : 'バックアップを読み込めませんでした。');
     } finally {
       if (restoreInput.current) restoreInput.current.value = '';
+    }
+  }
+
+  async function importQuestionBank(file: File | undefined) {
+    if (!file) return;
+    try {
+      const parsed: unknown = JSON.parse(await file.text());
+      const bank = validateQuestionBank(parsed);
+      if (isPrivateQuestionBankLoaded && !window.confirm('保存済みの問題バンクをこのファイルの内容に置き換えます。続けますか？')) return;
+
+      await saveQuestionBank(bank);
+      setQuestions(bank.questions);
+      setIsPrivateQuestionBankLoaded(true);
+      changePage('home');
+      setStorageMessage(
+        `${bank.questions.length}問の問題バンクを読み込み、ブラウザー内に保存しました。` +
+          (stateCanBeSaved ? '' : ' 学習履歴を読み込めていないため、進捗保存は無効のままです。'),
+      );
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : 'JSONを読み取れません。';
+      setStorageMessage(`問題バンクを読み込めませんでした。${detail}`);
+    } finally {
+      if (questionBankInput.current) questionBankInput.current.value = '';
     }
   }
 
@@ -251,6 +295,7 @@ function App() {
           <span className="sample-tag">{question.sourceLabel}</span>
           <span className="question-category">{question.category} · {question.id.slice(-2)}</span>
         </div>
+        {questionSourceText(question) && <span className="muted-small">{questionSourceText(question)}</span>}
         <h3>{question.title}</h3>
         <p className="question-card__prompt">{question.prompt}</p>
         <div className="question-card__answer">
@@ -326,7 +371,7 @@ function App() {
             return <div className={`today-row${done ? ' today-row--done' : ''}`} key={question.id}><span className="today-row__check">{done ? '✓' : '○'}</span><span className="today-row__text"><strong>{question.title}</strong><small>{question.category} · {question.id}</small></span><span className={`today-row__status${done ? ' today-row__status--done' : ''}`}>{done ? '学習済み' : '未学習'}</span><button className="text-button" onClick={() => changePage('memory')}>取り組む →</button></div>;
           })}
         </div>
-        <section className="notice-card"><span>i</span><p>この一覧はサンプル問題の学習状況を表示しています。目標時間や通知の設定は今後の追加機能です。</p></section>
+        <section className="notice-card"><span>i</span><p>{isPrivateQuestionBankLoaded ? '現在は非公開問題バンクの学習状況を表示しています。問題文・出典データはこの端末内に保存されます。' : '現在はサンプル問題の学習状況を表示しています。目標時間や通知の設定は今後の追加機能です。'}</p></section>
       </>
     );
   }
@@ -345,7 +390,7 @@ function App() {
       return <>
         <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--mint">◇</span><div><span className="eyebrow">MEMORY CHECK</span><h2>思い出せるか、確認してみましょう</h2><p>解答を見たあと、今の手応えを○△×で記録できます。</p></div></div>
         <div className="question-position"><span>問題 {questionIndex + 1}<small> / {questions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / questions.length) * 100}%` }} /></span></div>
-        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div><span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2>{answerVisible ? <div className="revealed-answer"><span className="eyebrow">解答</span><p>{currentQuestion.answer}</p><span className="eyebrow">解説</span><p>{currentQuestion.explanation}</p></div> : <button className="button button--primary button--wide" onClick={() => setAnswerVisible(true)}>解答・解説を見る</button>}</article>
+        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2>{answerVisible ? <div className="revealed-answer"><span className="eyebrow">解答</span><p>{currentQuestion.answer}</p><span className="eyebrow">解説</span><p>{currentQuestion.explanation}</p></div> : <button className="button button--primary button--wide" onClick={() => setAnswerVisible(true)}>解答・解説を見る</button>}</article>
         {answerVisible && <section className="rating-panel"><div><strong>どのくらい思い出せましたか？</strong><small>手応えと次回復習日を記録します。</small></div><div className="rating-buttons">{ratingOptions.map((option) => <button key={option.value} className={`rating-button rating-button--${option.tone}${currentProgress.rating === option.value ? ' is-selected' : ''}`} onClick={() => handleRating(currentQuestion.id, option.value)}><strong>{option.symbol}</strong><span>{option.label}</span></button>)}</div></section>}
         <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => moveQuestion(1)}>次の問題 <span>→</span></button></div>
       </>;
@@ -355,7 +400,7 @@ function App() {
       return <>
         <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--peach">☷</span><div><span className="eyebrow">MULTIPLE CHOICE</span><h2>選択肢を選んで答えましょう</h2><p>選ぶと正誤と解説が表示されます。</p></div></div>
         <div className="question-position"><span>問題 {questionIndex + 1}<small> / {questions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / questions.length) * 100}%` }} /></span></div>
-        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div><span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><div className="choice-list">{currentQuestion.choices.map((choice, index) => { const isCorrect = index === currentQuestion.correctChoice; const isSelected = selectedChoice === index; const stateClass = selectedChoice === null ? '' : isCorrect ? ' choice-button--correct' : isSelected ? ' choice-button--incorrect' : ' choice-button--muted'; return <button key={choice} className={`choice-button${stateClass}`} onClick={() => handleChoice(index)} disabled={selectedChoice !== null}><span>{String.fromCharCode(65 + index)}</span>{choice}{selectedChoice !== null && isCorrect && <b>正解</b>}</button>; })}</div>{selectedChoice !== null && <div className={`quiz-feedback${selectedChoice === currentQuestion.correctChoice ? ' quiz-feedback--correct' : ' quiz-feedback--incorrect'}`}><strong>{selectedChoice === currentQuestion.correctChoice ? '正解です' : '今回は不正解'}</strong><p>{currentQuestion.explanation}</p><small>正答：{currentQuestion.choices[currentQuestion.correctChoice]}</small></div>}</article>
+        <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><div className="choice-list">{currentQuestion.choices.map((choice, index) => { const isCorrect = index === currentQuestion.correctChoice; const isSelected = selectedChoice === index; const stateClass = selectedChoice === null ? '' : isCorrect ? ' choice-button--correct' : isSelected ? ' choice-button--incorrect' : ' choice-button--muted'; return <button key={choice} className={`choice-button${stateClass}`} onClick={() => handleChoice(index)} disabled={selectedChoice !== null}><span>{String.fromCharCode(65 + index)}</span>{choice}{selectedChoice !== null && isCorrect && <b>正解</b>}</button>; })}</div>{selectedChoice !== null && <div className={`quiz-feedback${selectedChoice === currentQuestion.correctChoice ? ' quiz-feedback--correct' : ' quiz-feedback--incorrect'}`}><strong>{selectedChoice === currentQuestion.correctChoice ? '正解です' : '今回は不正解'}</strong><p>{currentQuestion.explanation}</p><small>正答：{currentQuestion.choices[currentQuestion.correctChoice]}</small></div>}</article>
         <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => moveQuestion(1)}>次の問題 <span>→</span></button></div>
       </>;
     }
@@ -364,7 +409,7 @@ function App() {
       <div className="mode-intro"><span className="mode-intro__icon mode-intro__icon--lavender">✎</span><div><span className="eyebrow">WRITTEN RECALL</span><h2>思い出した内容を書いてみましょう</h2><p>書いたあとに解答例を表示し、自分で見比べます。</p></div></div>
       <section className="ai-note"><span className="ai-note__icon">AI</span><p><strong>AI採点は未実装です</strong><br />入力内容は自動採点・送信されません。解答例と見比べて自己確認してください。</p></section>
       <div className="question-position"><span>問題 {questionIndex + 1}<small> / {questions.length}</small></span><span className="position-track"><i style={{ width: `${((questionIndex + 1) / questions.length) * 100}%` }} /></span></div>
-      <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div><span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><label className="answer-label" htmlFor="written-answer">自分の回答</label><textarea id="written-answer" className="answer-input" placeholder="思い出した内容を入力してください…" value={writtenAnswer} onChange={(event) => setWrittenAnswer(event.target.value)} rows={5} />{writtenRevealed ? <div className="revealed-answer"><span className="eyebrow">解答例</span><p>{currentQuestion.answer}</p><span className="eyebrow">解説</span><p>{currentQuestion.explanation}</p></div> : <button className="button button--primary button--wide" onClick={() => { setWrittenRevealed(true); recordWrittenTest(currentQuestion.id); }}>解答例と見比べる</button>}</article>
+      <article className="study-card"><div className="question-card__topline"><span className="sample-tag">{currentQuestion.sourceLabel}</span><span className="question-category">{currentQuestion.category} · {currentQuestion.id}</span></div>{questionSourceText(currentQuestion) && <span className="muted-small">{questionSourceText(currentQuestion)}</span>}<span className="eyebrow">QUESTION</span><h2 className="study-card__prompt">{currentQuestion.prompt}</h2><label className="answer-label" htmlFor="written-answer">自分の回答</label><textarea id="written-answer" className="answer-input" placeholder="思い出した内容を入力してください…" value={writtenAnswer} onChange={(event) => setWrittenAnswer(event.target.value)} rows={5} />{writtenRevealed ? <div className="revealed-answer"><span className="eyebrow">解答例</span><p>{currentQuestion.answer}</p><span className="eyebrow">解説</span><p>{currentQuestion.explanation}</p></div> : <button className="button button--primary button--wide" onClick={() => { setWrittenRevealed(true); recordWrittenTest(currentQuestion.id); }}>解答例と見比べる</button>}</article>
       {writtenRevealed && <section className="rating-panel"><div><strong>自分で確認</strong><small>自動採点ではありません。見比べた感覚を記録できます。</small></div><div className="rating-buttons">{ratingOptions.map((option) => <button key={option.value} className={`rating-button rating-button--${option.tone}${currentProgress.rating === option.value ? ' is-selected' : ''}`} onClick={() => handleRating(currentQuestion.id, option.value)}><strong>{option.symbol}</strong><span>{option.label}</span></button>)}</div></section>}
       <div className="mode-actions"><button className="button button--outline" onClick={() => moveQuestion(-1)}>← 前の問題</button><button className="button button--primary" onClick={() => moveQuestion(1)}>次の問題 <span>→</span></button></div>
     </>;
@@ -387,10 +432,10 @@ function App() {
       </aside>
 
       <main className="main-area">
-        <header className="topbar"><div><span className="topbar__breadcrumb">学習室 <span>/</span> {currentTitle.title}</span><h1>{currentTitle.title}</h1></div><div className="topbar__actions"><button className="button button--quiet" onClick={downloadBackup}><span>↓</span> バックアップ</button><button className="button button--quiet" onClick={() => restoreInput.current?.click()}><span>↥</span> 復元</button><input ref={restoreInput} type="file" accept="application/json,.json" hidden onChange={(event) => void restoreBackup(event.target.files?.[0])} /></div></header>
+        <header className="topbar"><div><span className="topbar__breadcrumb">学習室 <span>/</span> {currentTitle.title}</span><h1>{currentTitle.title}</h1></div><div className="topbar__actions"><button className="button button--quiet" onClick={() => questionBankInput.current?.click()} disabled={!isLoaded}><span>＋</span> 問題読込</button><input ref={questionBankInput} type="file" accept="application/json,.json" hidden onChange={(event) => void importQuestionBank(event.target.files?.[0])} /><button className="button button--quiet" onClick={downloadBackup}><span>↓</span> バックアップ</button><button className="button button--quiet" onClick={() => restoreInput.current?.click()}><span>↥</span> 復元</button><input ref={restoreInput} type="file" accept="application/json,.json" hidden onChange={(event) => void restoreBackup(event.target.files?.[0])} /></div></header>
         <div className="content-wrap">
-          {storageMessage && <div className={`storage-banner${storageMessage.includes('できません') || storageMessage.includes('利用できません') ? ' storage-banner--error' : ''}`} role="status">{storageMessage}<button onClick={() => setStorageMessage('')} aria-label="閉じる">×</button></div>}
-          <div className="page-lead"><p>{currentTitle.subtitle}</p><span className="sample-disclaimer"><span>!</span> sample/AI作成練習問題です。公式過去問・教材の実データではありません。</span></div>
+          {storageMessage && <div className={`storage-banner${storageMessage.includes('できません') || storageMessage.includes('利用できません') || storageMessage.includes('読み込めません') ? ' storage-banner--error' : ''}`} role="status">{storageMessage}<button onClick={() => setStorageMessage('')} aria-label="閉じる">×</button></div>}
+          <div className="page-lead"><p>{currentTitle.subtitle}</p><span className="sample-disclaimer"><span>!</span> {isPrivateQuestionBankLoaded ? `非公開の問題バンクを使用中です（${questions.length}問・このブラウザーに保存）。` : 'sample/AI作成練習問題です。公式過去問・教材の実データではありません。'}</span></div>
           {!isLoaded && <div className="loading-card">学習データを読み込んでいます…</div>}
           {isLoaded && page === 'home' && renderHome()}
           {isLoaded && page === 'today' && renderToday()}

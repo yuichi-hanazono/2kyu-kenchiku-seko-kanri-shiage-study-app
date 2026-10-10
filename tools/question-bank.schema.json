@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local Study Question Bank",
+  "description": "Browser-import format for verified multiple-choice questions. Keep private question content outside the repository.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["app", "schemaVersion", "questions"],
+  "properties": {
+    "app": { "const": "building-management-study-app" },
+    "schemaVersion": { "const": 1 },
+    "questions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/question" }
+    }
+  },
+  "$defs": {
+    "question": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "sourceLabel", "title", "category", "prompt", "answer", "explanation",
+        "choices", "correctChoice", "year", "examSection", "specialty", "questionNumber",
+        "contentKind", "answerVerification", "distribution", "reviewedAt", "questionType", "reviewStatus", "officialAnswerSource", "source"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "sourceLabel": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "category": { "type": "string", "minLength": 1 },
+        "prompt": { "type": "string", "minLength": 1 },
+        "answer": { "type": "string", "minLength": 1 },
+        "explanation": { "type": "string" },
+        "choices": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "correctChoice": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "year": { "type": "integer", "minimum": 1 },
+        "examSection": { "const": "第二次検定" },
+        "specialty": { "const": "仕上げ" },
+        "questionNumber": { "type": "string", "minLength": 1 },
+        "contentKind": { "const": "official_past_question" },
+        "answerVerification": { "const": "official_key_verified" },
+        "distribution": { "const": "private_only" },
+        "reviewedAt": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+        },
+        "questionType": { "const": "multiple_choice" },
+        "reviewStatus": { "const": "verified" },
+        "officialAnswerSource": { "$ref": "#/$defs/officialAnswerSource" },
+        "source": { "$ref": "#/$defs/source" }
+      }
+    },
+    "officialAnswerSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issuer", "url", "reference", "checkedAt", "keyOption"],
+      "properties": {
+        "issuer": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "format": "uri", "pattern": "^https://www\\.fcip-shiken\\.jp/" },
+        "reference": { "type": "string", "minLength": 1 },
+        "checkedAt": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+        },
+        "keyOption": { "type": "integer", "minimum": 1, "maximum": 4, "description": "Official answer option number, 1-based." }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document", "citations"],
+      "properties": {
+        "document": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fileName", "sha256"],
+          "properties": {
+            "fileName": { "type": "string", "minLength": 1 },
+            "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" }
+          }
+        },
+        "citations": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/citation" },
+          "allOf": [
+            { "contains": { "properties": { "role": { "const": "question" } }, "required": ["role"] } },
+            { "contains": { "properties": { "role": { "const": "choice" } }, "required": ["role"] } },
+            { "contains": { "properties": { "role": { "const": "answer" } }, "required": ["role"] } }
+          ]
+        }
+      }
+    },
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pdfPage", "role", "quote", "extractionMethod", "reviewStatus"],
+      "properties": {
+        "pdfPage": { "type": "integer", "minimum": 1 },
+        "printedPageLabel": { "type": ["string", "null"] },
+        "role": {
+          "enum": ["question", "choice", "answer", "explanation", "figure_or_table", "other"]
+        },
+        "quote": { "type": "string" },
+        "extractionMethod": {
+          "enum": ["pdfjs_text_layer", "tesseract_js_ocr", "manual_transcription"]
+        },
+        "reviewStatus": { "const": "verified" }
+      }
+    }
+  }
+}

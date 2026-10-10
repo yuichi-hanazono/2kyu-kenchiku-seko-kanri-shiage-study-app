@@ -23,6 +23,7 @@ function printHelp() {
     '',
     'Options:',
     '  --verify-pages <pages>  目視照合するPDFページを5〜10ページ指定。例: 1-5 または 2,8,15,22,30',
+    '  --ocr-pages <pages|all> OCR対象ページを追加で限定。例: 150-154、allは制限なし（元PDFの1始まり）',
     '  --out <directory>       出力先。省略時は ./pdf-intake-output/<PDF名>-<hash8>',
     '  --ocr <auto|always|off> 文字レイヤーが薄いページのOCR方法 (default: auto)',
     '  --lang <codes>          OCR言語 (default: jpn+eng)',
@@ -41,6 +42,7 @@ function parseArgs(argv) {
   const options = {
     input: null,
     verifyPagesSpec: null,
+    ocrPageSelection: null,
     outDir: null,
     ocrMode: 'auto',
     languages: 'jpn+eng',
@@ -53,6 +55,7 @@ function parseArgs(argv) {
   };
   const valueOptions = new Set([
     '--verify-pages',
+    '--ocr-pages',
     '--out',
     '--ocr',
     '--lang',
@@ -80,6 +83,7 @@ function parseArgs(argv) {
       }
       index += 1;
       if (arg === '--verify-pages') options.verifyPagesSpec = value;
+      if (arg === '--ocr-pages') options.ocrPageSelection = parseOcrPageSelection(value);
       if (arg === '--out') options.outDir = value;
       if (arg === '--ocr') options.ocrMode = value;
       if (arg === '--lang') options.languages = value;
@@ -160,6 +164,46 @@ function parsePageSelection(spec) {
     throw new Error('--verify-pages は重複を除いて5〜10ページを指定してください。');
   }
   return result;
+}
+
+function parseOcrPageSelection(spec) {
+  if (spec.trim().toLowerCase() === 'all') return { all: true, ranges: [] };
+
+  const parts = spec.split(/[、,]/u).map((part) => part.trim());
+  if (parts.length === 0 || parts.some((part) => !part)) {
+    throw new Error('--ocr-pages は all またはPDFページ番号・範囲を指定してください。');
+  }
+
+  const ranges = [];
+  for (const part of parts) {
+    const rangeMatch = part.match(/^(\d+)\s*-\s*(\d+)$/u);
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1]);
+      const end = Number(rangeMatch[2]);
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start) {
+        throw new Error('--ocr-pages のページ範囲が不正です: ' + part);
+      }
+      ranges.push([start, end]);
+      continue;
+    }
+
+    const pageNumber = Number(part);
+    if (!/^\d+$/u.test(part) || !Number.isSafeInteger(pageNumber) || pageNumber < 1) {
+      throw new Error('--ocr-pages のページ指定が不正です: ' + part);
+    }
+    ranges.push([pageNumber, pageNumber]);
+  }
+  return { all: false, ranges };
+}
+
+function isOcrPageSelected(pdfPage, selection) {
+  return !selection || selection.all || selection.ranges.some(([start, end]) => pdfPage >= start && pdfPage <= end);
+}
+
+function describeOcrPageSelection(selection) {
+  if (!selection) return null;
+  if (selection.all) return 'all';
+  return selection.ranges.map(([start, end]) => start === end ? String(start) : start + '-' + end).join(',');
 }
 
 async function sha256File(filePath) {
@@ -521,6 +565,10 @@ async function run(options) {
     if (selectedPages.some((page) => page > pageCount)) {
       throw new Error('照合指定ページがPDFページ数を超えています。PDFページ数: ' + pageCount);
     }
+    if (options.ocrPageSelection && !options.ocrPageSelection.all &&
+        options.ocrPageSelection.ranges.some(([, end]) => end > pageCount)) {
+      throw new Error('OCR指定ページがPDFページ数を超えています。PDFページ数: ' + pageCount);
+    }
 
     const metadataResult = await pdfDocument.getMetadata();
     const metadata = {
@@ -561,12 +609,18 @@ async function run(options) {
     const workerState = { worker: null, initializationError: null, rendererAvailable };
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'cic-pdf-intake-'));
     const needsOcr = pageRecords.filter((page) =>
-      options.ocrMode === 'always' ||
-      (options.ocrMode === 'auto' && page.quality.visibleChars < options.minTextChars),
+      isOcrPageSelected(page.pdfPage, options.ocrPageSelection) && (
+        options.ocrMode === 'always' ||
+        (options.ocrMode === 'auto' && page.quality.visibleChars < options.minTextChars)
+      ),
     );
 
     if (options.ocrMode === 'off') {
-      for (const page of pageRecords) page.ocr.status = 'disabled_by_option';
+      for (const page of pageRecords) {
+        page.ocr.status = isOcrPageSelected(page.pdfPage, options.ocrPageSelection)
+          ? 'disabled_by_option'
+          : 'skipped_outside_ocr_page_selection';
+      }
     } else {
       for (const page of needsOcr) {
         console.log('OCRを試行します: PDFページ ' + page.pdfPage);
@@ -588,9 +642,11 @@ async function run(options) {
       }
       for (const page of pageRecords) {
         if (page.ocr.status === 'not_attempted') {
-          page.ocr.status = options.ocrMode === 'auto'
-            ? 'skipped_text_layer_present'
-            : 'not_attempted';
+          page.ocr.status = !isOcrPageSelected(page.pdfPage, options.ocrPageSelection)
+            ? 'skipped_outside_ocr_page_selection'
+            : options.ocrMode === 'auto'
+              ? 'skipped_text_layer_present'
+              : 'not_attempted';
         }
       }
     }
@@ -635,6 +691,8 @@ async function run(options) {
       extraction: {
         engine: 'pdfjs-dist',
         ocrMode: options.ocrMode,
+        ocrPageSelection: describeOcrPageSelection(options.ocrPageSelection),
+        ocrPageNumbering: 'original_pdf_1_based',
         ocrLanguages: options.languages,
         ocrDpi: options.dpi,
         minTextChars: options.minTextChars,
@@ -649,6 +707,7 @@ async function run(options) {
           completed: pageRecords.filter((page) => page.ocr.status === 'ocr_completed_needs_manual_review').length,
           failed: pageRecords.filter((page) => page.ocr.status === 'ocr_failed').length,
           notRun: pageRecords.filter((page) => page.ocr.status.startsWith('not_run')).length,
+          skippedByPageSelection: pageRecords.filter((page) => page.ocr.status === 'skipped_outside_ocr_page_selection').length,
         },
         pageSummaries: pageRecords.map((page) => ({
           pdfPage: page.pdfPage,

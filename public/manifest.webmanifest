@@ -1,0 +1,19 @@
+{
+  "name": "2級建築施工管理技士 仕上げ 学習室",
+  "short_name": "仕上げ学習室",
+  "lang": "ja",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f7f8fc",
+  "theme_color": "#5262d9",
+  "description": "2級建築施工管理技士（仕上げ）の個人学習アプリ",
+  "icons": [
+    {
+      "src": "./favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
