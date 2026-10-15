@@ -173,6 +173,7 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid rgba(82, 98, 2
 .question-card__prompt { margin: 0; color: #59647d; font-size: 12px; line-height: 1.9; white-space: pre-wrap; }
 .question-card__answer, .revealed-answer { margin-top: 18px; padding: 16px 17px; border: 1px solid #e9ecfa; border-radius: 12px; background: #f8f9ff; }
 .question-card__answer p, .revealed-answer p { margin: 5px 0 12px; color: #4d5874; font-size: 11px; line-height: 1.8; }
+.question-card__answer .written-answer-text, .revealed-answer .written-answer-text { white-space: pre-line; overflow-wrap: anywhere; line-height: 1.95; }
 .question-card__answer p:last-child, .revealed-answer p:last-child { margin-bottom: 0; }
 .answer-evidence { margin: 10px 0 16px; padding: 10px 12px; border: 1px solid #e7eaf2; border-radius: 10px; color: #59647d; background: #f8f9fc; }
 .answer-evidence strong { display: block; margin-bottom: 4px; font-size: 10px; }

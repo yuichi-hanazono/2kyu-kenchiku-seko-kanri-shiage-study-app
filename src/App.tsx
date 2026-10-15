@@ -108,6 +108,20 @@ function publisherReferenceSourceText(question: WrittenQuestion): string {
   return `出典：${answer.publisher} / ${answer.reference} / ${answer.source.document.fileName} / ${sourcePageText(answer.source)}`;
 }
 
+function formatWrittenReferenceAnswer(text: string): string {
+  return text
+    .replace(/\r\n?/gu, '\n')
+    .replace(/[ \t]*(【設問[^】]+】)[ \t]*/gu, '\n$1\n')
+    .replace(/[ \t]*(【選択肢[^】]*】)[ \t]*/gu, '$1\n')
+    .replace(/[ \t]*(①\s*工程名又は作業名：)/gu, '\n$1')
+    .replace(/[ \t]*(②\s*主な要因と作業内容：)/gu, '\n$1')
+    .replace(/[ \t]*(③\s*対応策：)/gu, '\n$1')
+    .replace(/[ \t]*／[ \t]*/gu, '\n')
+    .replace(/[ \t]+\n/gu, '\n')
+    .replace(/\n{2,}/gu, '\n')
+    .trim();
+}
+
 function publisherMultipleChoiceSourceText(source: PublisherReferenceSource): string {
   return `出典：${source.publisher} / ${source.reference} / ${source.source.document.fileName} / ${sourcePageText(source.source)}`;
 }
@@ -445,7 +459,7 @@ function App() {
       return (
         <div className={className}>
           <span className="eyebrow">出版社参考答案</span>
-          <p>{question.publisher_reference_answer.text}</p>
+          <p className="written-answer-text">{formatWrittenReferenceAnswer(question.publisher_reference_answer.text)}</p>
           <p className="muted-small">出版社資料に基づく参考答案です。公式正答ではありません。</p>
           <p className="muted-small">{publisherReferenceSourceText(question)}</p>
           {question.explanation && <><span className="eyebrow">解説</span><p>{question.explanation}</p></>}
