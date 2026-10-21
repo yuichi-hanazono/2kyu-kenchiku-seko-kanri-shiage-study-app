@@ -1,0 +1,27 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    match /users/{userId}/banks/{fileName} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && fileName.matches('^bank-[0-9a-f]{64}\\.json$')
+        && request.resource.size > 0
+        && request.resource.size <= 10485760
+        && request.resource.contentType == 'application/json'
+        && request.resource.metadata.bankId is string
+        && request.resource.metadata.bankHash is string
+        && request.resource.metadata.bankId == fileName.split('.')[0]
+        && request.resource.metadata.bankId == 'bank-' + request.resource.metadata.bankHash
+        && request.resource.metadata.bankHash.matches('^[0-9a-f]{64}$');
+      allow update, delete: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

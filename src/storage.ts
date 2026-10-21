@@ -7,12 +7,46 @@ import {
   type StudyState,
 } from './types';
 import { validateQuestionBank, type QuestionBank } from './questionBank';
+import { createUuid } from './uuid';
+import { deduplicateStudyEvents, localDataSignature, localSyncSignature, validateStudyEvent, type StudyEvent } from './syncDomain';
 
 const DATABASE_NAME = 'building-management-study-app';
 const DATABASE_VERSION = 1;
 const STORE_NAME = 'app-state';
 const STATE_KEY = 'study-progress';
 const QUESTION_BANK_KEY = 'private-question-bank';
+const OUTBOX_KEY = 'study-event-outbox';
+const SYNC_METADATA_KEY = 'cloud-sync-metadata';
+const DEVICE_ID_KEY = 'sync-device-id';
+
+export type LocalSyncMetadata = {
+  schemaVersion: 1;
+  userId: string;
+  bankId: string;
+  bankHash: string;
+  knownEventIds: string[];
+};
+
+export function validateLocalSyncMetadata(value: unknown): LocalSyncMetadata {
+  if (
+    !isObjectRecord(value) || value.schemaVersion !== 1 || typeof value.userId !== 'string' || value.userId.length < 1
+    || typeof value.bankId !== 'string' || !/^bank-[\da-f]{64}$/iu.test(value.bankId)
+    || typeof value.bankHash !== 'string' || !/^[\da-f]{64}$/iu.test(value.bankHash)
+    || value.bankId !== `bank-${value.bankHash.toLowerCase()}`
+    || !Array.isArray(value.knownEventIds) || !value.knownEventIds.every((id) => typeof id === 'string')
+  ) {
+    throw new Error('端末の同期情報を読み取れません。既存データは変更していません。');
+  }
+  return value as LocalSyncMetadata;
+}
+
+export type LocalSyncSnapshot = {
+  bank: QuestionBank | null;
+  state: StudyState;
+  outbox: StudyEvent[];
+  signature: string;
+  syncSignature: string;
+};
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -151,6 +185,61 @@ export async function saveStudyState(state: StudyState): Promise<void> {
   await withStore('readwrite', (store) => store.put(state, STATE_KEY));
 }
 
+export function makeDeviceBackup(
+  state: StudyState,
+  bank: QuestionBank | null,
+  outbox: readonly StudyEvent[] = [],
+  syncMetadata: LocalSyncMetadata | null = null,
+): string {
+  return JSON.stringify({
+    app: 'building-management-study-app',
+    schemaVersion: 2,
+    backupType: 'device-sync-backup-v1',
+    exportedAt: new Date().toISOString(),
+    progress: state,
+    questionBank: bank,
+    outbox: deduplicateStudyEvents(outbox),
+    syncMetadata,
+  }, null, 2);
+}
+
+export async function restoreLocalStudyData(
+  state: StudyState,
+  bank?: QuestionBank | null,
+  outbox: readonly StudyEvent[] = [],
+  syncMetadata: LocalSyncMetadata | null = null,
+): Promise<void> {
+  const checkedOutbox = deduplicateStudyEvents(outbox);
+  const checkedSyncMetadata = syncMetadata === null ? null : validateLocalSyncMetadata(syncMetadata);
+  const database = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    store.put(state, STATE_KEY);
+    if (bank !== undefined) {
+      if (bank) store.put(bank, QUESTION_BANK_KEY);
+      else store.delete(QUESTION_BANK_KEY);
+    }
+    // A normal JSON restore starts a new local lineage. A device backup may carry
+    // its pending events and link so they can be retried without double counting.
+    store.put(checkedOutbox, OUTBOX_KEY);
+    if (checkedSyncMetadata) store.put(checkedSyncMetadata, SYNC_METADATA_KEY);
+    else store.delete(SYNC_METADATA_KEY);
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error('バックアップからの復元に失敗しました。'));
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error('バックアップからの復元を中断しました。'));
+    };
+  });
+}
+
 export async function loadQuestionBank(): Promise<QuestionBank | null> {
   const saved: unknown = await withStore('readonly', (store) => store.get(QUESTION_BANK_KEY));
   return saved === undefined ? null : validateQuestionBank(saved);
@@ -160,6 +249,274 @@ export async function saveQuestionBank(value: unknown): Promise<QuestionBank> {
   const bank = validateQuestionBank(value);
   await withStore('readwrite', (store) => store.put(bank, QUESTION_BANK_KEY));
   return bank;
+}
+
+export async function loadStudyEventOutbox(): Promise<StudyEvent[]> {
+  const saved: unknown = await withStore('readonly', (store) => store.get(OUTBOX_KEY));
+  if (saved === undefined) return [];
+  if (!Array.isArray(saved)) throw new Error('未同期イベントの保存形式が不正です。既存データは変更していません。');
+  return deduplicateStudyEvents(saved.map(validateStudyEvent));
+}
+
+export async function loadLocalSyncSnapshot(): Promise<LocalSyncSnapshot> {
+  const database = await openDatabase();
+  const values = await new Promise<{ bank: unknown; state: unknown; outbox: unknown }>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+    let bank: unknown;
+    let state: unknown;
+    let outbox: unknown;
+    const requests = [store.get(QUESTION_BANK_KEY), store.get(STATE_KEY), store.get(OUTBOX_KEY)];
+    requests[0].onsuccess = () => { bank = requests[0].result; };
+    requests[1].onsuccess = () => { state = requests[1].result; };
+    requests[2].onsuccess = () => { outbox = requests[2].result; };
+    for (const request of requests) {
+      request.onerror = () => {
+        transaction.abort();
+        reject(request.error ?? new Error('端末データを読み込めませんでした。'));
+      };
+    }
+    transaction.oncomplete = () => {
+      database.close();
+      resolve({ bank, state, outbox });
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error('端末データを読み込めませんでした。'));
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error('端末データの読み込みを中断しました。'));
+    };
+  });
+
+  const bank = values.bank === undefined ? null : validateQuestionBank(values.bank);
+  if (
+    values.state !== undefined
+    && (!isObjectRecord(values.state) || (values.state.schemaVersion !== 1 && values.state.schemaVersion !== 2) || !isObjectRecord(values.state.records))
+  ) {
+    throw new Error('保存データ形式を認識できません。既存データは変更していません。');
+  }
+  const state = values.state === undefined ? EMPTY_STATE : normalizeState(values.state, new Set(), true);
+  if (values.outbox !== undefined && !Array.isArray(values.outbox)) throw new Error('未同期イベントの保存形式が不正です。');
+  const outbox = values.outbox === undefined ? [] : deduplicateStudyEvents((values.outbox as unknown[]).map(validateStudyEvent));
+  return {
+    bank,
+    state,
+    outbox,
+    signature: localDataSignature(bank, state),
+    syncSignature: localSyncSignature(bank, state, outbox),
+  };
+}
+
+export async function appendStudyEventAndState(event: StudyEvent, state: StudyState): Promise<void> {
+  const checkedEvent = validateStudyEvent(event);
+  const database = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.get(OUTBOX_KEY);
+    request.onsuccess = () => {
+      try {
+        const saved: unknown = request.result;
+        if (saved !== undefined && !Array.isArray(saved)) throw new Error('未同期イベントの保存形式が不正です。');
+        const existingEvents = saved === undefined ? [] : (saved as unknown[]).map(validateStudyEvent);
+        const outbox = deduplicateStudyEvents([...existingEvents, checkedEvent]);
+        store.put(outbox, OUTBOX_KEY);
+        store.put(state, STATE_KEY);
+      } catch (error) {
+        transaction.abort();
+        reject(error);
+      }
+    };
+    request.onerror = () => {
+      transaction.abort();
+      reject(request.error ?? new Error('未同期イベントを読み込めませんでした。'));
+    };
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error('学習イベントを保存できませんでした。'));
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error('学習イベントの保存を中断しました。'));
+    };
+  });
+}
+
+export async function acknowledgeStudyEvents(eventIds: readonly string[]): Promise<void> {
+  if (eventIds.length === 0) return;
+  const acknowledged = new Set(eventIds);
+  const database = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.get(OUTBOX_KEY);
+    request.onsuccess = () => {
+      const saved: unknown = request.result;
+      if (saved === undefined) return;
+      if (!Array.isArray(saved)) {
+        transaction.abort();
+        reject(new Error('未同期イベントの保存形式が不正です。'));
+        return;
+      }
+      try {
+        const remaining = deduplicateStudyEvents(saved.map(validateStudyEvent)).filter((event) => !acknowledged.has(event.eventId));
+        store.put(remaining, OUTBOX_KEY);
+      } catch (error) {
+        transaction.abort();
+        reject(error);
+      }
+    };
+    request.onerror = () => {
+      transaction.abort();
+      reject(request.error ?? new Error('未同期イベントを更新できませんでした。'));
+    };
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error('未同期イベントを更新できませんでした。'));
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error('未同期イベントの更新を中断しました。'));
+    };
+  });
+}
+
+export async function loadLocalSyncMetadata(): Promise<LocalSyncMetadata | null> {
+  const saved: unknown = await withStore('readonly', (store) => store.get(SYNC_METADATA_KEY));
+  if (saved === undefined) return null;
+  return validateLocalSyncMetadata(saved);
+}
+
+export async function saveLocalSyncMetadata(metadata: LocalSyncMetadata): Promise<void> {
+  await withStore('readwrite', (store) => store.put(metadata, SYNC_METADATA_KEY));
+}
+
+export async function getOrCreateDeviceId(): Promise<string> {
+  const saved: unknown = await withStore('readonly', (store) => store.get(DEVICE_ID_KEY));
+  if (typeof saved === 'string' && /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu.test(saved)) return saved;
+  const deviceId = createUuid();
+  await withStore('readwrite', (store) => store.put(deviceId, DEVICE_ID_KEY));
+  return deviceId;
+}
+
+export async function replaceLocalCloudData(
+  bank: QuestionBank,
+  state: StudyState,
+  metadata: LocalSyncMetadata,
+  expectedSyncSignature: string,
+): Promise<void> {
+  const database = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    let localBank: unknown;
+    let localState: unknown;
+    let localOutbox: unknown;
+    let readCount = 0;
+    let failure: unknown;
+    const commitIfUnchanged = () => {
+      readCount += 1;
+      if (readCount !== 3) return;
+      try {
+        const checkedBank = localBank === undefined ? null : validateQuestionBank(localBank);
+        if (
+          localState !== undefined
+          && (!isObjectRecord(localState) || (localState.schemaVersion !== 1 && localState.schemaVersion !== 2) || !isObjectRecord(localState.records))
+        ) throw new Error('保存データ形式を認識できません。既存データは変更していません。');
+        const checkedState = localState === undefined ? EMPTY_STATE : normalizeState(localState, new Set(), true);
+        if (localOutbox !== undefined && !Array.isArray(localOutbox)) throw new Error('未同期イベントの保存形式が不正です。');
+        const checkedOutbox = localOutbox === undefined
+          ? []
+          : deduplicateStudyEvents((localOutbox as unknown[]).map(validateStudyEvent));
+        if (localSyncSignature(checkedBank, checkedState, checkedOutbox) !== expectedSyncSignature) {
+          throw new Error('クラウドからの取得中に端末データが更新されました。現在データを守るため復元を中止しました。もう一度バックアップして実行してください。');
+        }
+        store.put(bank, QUESTION_BANK_KEY);
+        store.put(state, STATE_KEY);
+        store.put([], OUTBOX_KEY);
+        store.put(metadata, SYNC_METADATA_KEY);
+      } catch (error) {
+        failure = error;
+        transaction.abort();
+      }
+    };
+    const bankRequest = store.get(QUESTION_BANK_KEY);
+    const stateRequest = store.get(STATE_KEY);
+    const outboxRequest = store.get(OUTBOX_KEY);
+    bankRequest.onsuccess = () => { localBank = bankRequest.result; commitIfUnchanged(); };
+    stateRequest.onsuccess = () => { localState = stateRequest.result; commitIfUnchanged(); };
+    outboxRequest.onsuccess = () => { localOutbox = outboxRequest.result; commitIfUnchanged(); };
+    for (const request of [bankRequest, stateRequest, outboxRequest]) {
+      request.onerror = () => {
+        failure = request.error ?? new Error('端末データを読み込めませんでした。');
+        transaction.abort();
+      };
+    }
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error('クラウドデータの保存に失敗しました。'));
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(failure ?? transaction.error ?? new Error('クラウドデータの保存を中断しました。'));
+    };
+  });
+}
+
+export async function saveMigratedLocalLink(metadata: LocalSyncMetadata, baselineEventIds: readonly string[]): Promise<void> {
+  const database = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const baseline = new Set(baselineEventIds);
+    const outboxRequest = store.get(OUTBOX_KEY);
+    outboxRequest.onsuccess = () => {
+      const saved: unknown = outboxRequest.result;
+      if (saved !== undefined && !Array.isArray(saved)) {
+        transaction.abort();
+        reject(new Error('未同期イベントの保存形式が不正です。'));
+        return;
+      }
+      try {
+        const outbox = saved === undefined ? [] : deduplicateStudyEvents((saved as unknown[]).map(validateStudyEvent));
+        store.put(outbox.filter((event) => !baseline.has(event.eventId)), OUTBOX_KEY);
+        store.put(metadata, SYNC_METADATA_KEY);
+      } catch (error) {
+        transaction.abort();
+        reject(error);
+      }
+    };
+    outboxRequest.onerror = () => {
+      transaction.abort();
+      reject(outboxRequest.error ?? new Error('未同期イベントを読み込めませんでした。'));
+    };
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error('同期情報を保存できませんでした。'));
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error('同期情報の保存を中断しました。'));
+    };
+  });
 }
 
 export function progressFor(state: StudyState, questionId: string): QuestionProgress {

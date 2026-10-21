@@ -24,7 +24,58 @@ GitHub Pagesへの公開準備:
 - `.github/workflows/deploy-pages.yml` が`main`へのpush後に本番ビルドを作成します。
 - リポジトリ設定の Pages で、公開元を「GitHub Actions」に一度設定します。
 - 公開後はスマートフォンのブラウザーでURLを開き、「ホーム画面に追加」を選べます。
-- 問題データと学習履歴は端末ごとのIndexedDBに保存されます。端末間で同じ履歴を共有するには、後続のログイン・クラウド同期機能が必要です。
+- 問題データと学習履歴はIndexedDBに保存され、Firebaseを設定するとGoogleアカウント経由で端末間同期できます。未設定時は従来どおりローカルのみで動作します。
+
+## スマホ・PC間の同期設定
+
+同期を使うと、問題バンク本体は認証ユーザー専用のFirebase Storageパスに、学習イベントと同期メタデータはFirestoreに保存します。サンプル版・ローカル学習はFirebase設定なしでも利用できます。Firebase Web設定はブラウザーへ配布される公開クライアント設定であり、管理者キー・サービスアカウント鍵は使用しません。
+
+### Firebaseプロジェクト
+
+1. Firebase ConsoleでプロジェクトとWebアプリを作成し、AuthenticationのGoogleプロバイダを有効にします。
+2. Firestore Databaseを作成し、`firestore.rules`をデプロイします。リージョンは利用者に近い場所を選んでください。
+3. Cloud Storageのバケットを作成し、`storage.rules`をデプロイします。Cloud Storage for Firebaseの利用には従量課金のBlazeプランが必要です（Blazeでも対象範囲の無料利用枠はあります）。料金・利用量を確認してから有効化してください。[Firebaseの料金要件](https://firebase.google.com/docs/storage/faqs-storage-changes-announced-sept-2024)
+4. Firebase Authenticationの「設定」→「承認済みドメイン」に `yuichi-hanazono.github.io` を追加します。開発時は `localhost` も追加してください（最近作成したFirebaseプロジェクトではlocalhostが初期登録されない場合があります）。Googleプロバイダの有効化と承認済みドメインが必要です。[Googleログインの公式手順](https://firebase.google.com/docs/auth/web/google-signin)
+5. `tools/firebase-storage-cors.json`を使い、ブラウザーから非公開バケットを直接取得するためのCORSを設定します（gcloud CLIが必要です）。[WebからのStorage取得にはCORS設定が必要です](https://firebase.google.com/docs/storage/web/download-files)
+
+```powershell
+gcloud storage buckets update gs://<FirebaseのStorageバケット名> --cors-file=tools/firebase-storage-cors.json
+```
+
+Firestore / StorageルールはFirebase CLIでデプロイできます。プロジェクトIDはFirebase Consoleのプロジェクト設定から指定してください。
+
+```powershell
+pnpm dlx firebase-tools login
+pnpm dlx firebase-tools deploy --only firestore:rules,storage --project <FirebaseプロジェクトID>
+```
+
+6. ローカル開発ではFirebase Consoleのプロジェクト設定にあるWebアプリ設定を使い、`.env.example`を参考に`.env`を作成します。APIキー、認証ドメイン、プロジェクトID、Storageバケット名、アプリIDを`VITE_FIREBASE_*`へ設定して`pnpm dev`を起動します。`.env`はGitへ登録しません。
+7. GitHub Pagesでは、リポジトリのSettings → Secrets and variables → Actions → Variablesに次の変数を追加し、`main`へ反映して再デプロイします。これらは公開クライアント設定なのでActionsの「Variables」を使い、Admin SDK鍵やサービスロール鍵は登録しないでください。
+
+```text
+FIREBASE_API_KEY
+FIREBASE_AUTH_DOMAIN
+FIREBASE_PROJECT_ID
+FIREBASE_STORAGE_BUCKET
+FIREBASE_APP_ID
+```
+
+Firebase設定が不足しているビルドでは、アプリに不足項目を表示してクラウド機能のみ無効にします。
+
+### 初回移行と2台目の利用
+
+1. **移行元のスマホ**で現在使っている非公開JSON問題バンクが読み込まれていることを確認し、Googleログインします。
+2. 「端末全体をバックアップ」を押して、問題バンク・学習履歴を含むJSONを安全な場所へ保存します。画面にバックアップ済みと出てから「この端末から初回移行」を選びます。初回移行は既存クラウドデータを上書きせず、問題バンクの内容ハッシュと初期StudyStateスナップショットを登録します。
+3. **PC**で同じGitHub Pages URLを開き、同じGoogleアカウントでログインします。PCに残っているローカルデータがあれば、先に端末全体バックアップを作成し、「クラウドからこの端末へ取得」を明示実行します。取得するとPCの問題バンク・学習状態を置き換えますが、問題バンクを混ぜず、取得中にローカルデータが変わった場合は保存を中止します。
+4. 以降、オンライン時は学習イベントを自動同期します。必要なら「今すぐ同期」を押します。スマホ・PCのどちらでもオフライン学習は続けられ、再接続時に同期します。
+
+学習イベントはUUIDをFirestoreドキュメントIDとして保存し、同じイベントの再送は冪等に処理します。クラウド同期時もStudyState全体を上書きせず、初回スナップショットへイベントを適用します。違う問題バンクのままでは同期せず、別バンクへ切り替える場合はバックアップ後に明示的なクラウド取得を行います。同じ問題の評価・苦手設定が別端末で競合したときは警告し、イベント履歴は保持します。
+
+同期済み端末で別版の問題JSONを直接読み込む操作は、学習履歴を別バンクへ混ぜないため停止します。問題バンクを更新する場合は、同期成功を確認して未同期イベントをなくした後、右上の通常の「バックアップ」で学習データJSONを保存し、そのJSONを「復元」してクラウドとの端末紐付けを解除してから新しいJSONを読み込んでください（通常JSONの復元は現在の問題バンクを残したまま連携を解除します）。クラウド側の問題バンク版更新フローは後続対応です。
+
+### 教材データについて
+
+初回移行すると、非公開問題バンクJSONの内容全体がFirebase Storageへ送られます。Firestoreには問題バンクID・SHA-256・問題数・更新時刻と、初期移行時の学習状態、各学習イベントを保存します。Firebaseの管理者やプロジェクトへアクセス権を持つ人から教材データを秘匿する仕組みではありません。教材・出版社の利用条件、第三者への複製・クラウド保管の可否、データ保管地域、バックアップの保管方法を確認してから移行してください。問題バンクのJSONや教材原本は公開リポジトリへ登録しないでください。
 
 教材PDFの初回取り込み確認（教材PDFはリポジトリ外に保管）:
 

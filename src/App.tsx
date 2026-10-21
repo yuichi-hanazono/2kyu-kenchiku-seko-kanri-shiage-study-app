@@ -1,7 +1,43 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
 import sampleQuestions from '../data/sample/questions.json';
-import { loadQuestionBank, loadStudyState, makeBackup, progressFor, readBackup, saveQuestionBank, saveStudyState } from './storage';
-import { validateQuestionBank } from './questionBank';
+import {
+  acknowledgeStudyEvents,
+  appendStudyEventAndState,
+  getOrCreateDeviceId,
+  loadLocalSyncMetadata,
+  loadLocalSyncSnapshot,
+  loadQuestionBank,
+  loadStudyEventOutbox,
+  loadStudyState,
+  makeBackup,
+  makeDeviceBackup,
+  progressFor,
+  readBackup,
+  replaceLocalCloudData,
+  restoreLocalStudyData,
+  saveLocalSyncMetadata,
+  saveMigratedLocalLink,
+  saveQuestionBank,
+  saveStudyState,
+  validateLocalSyncMetadata,
+  type LocalSyncMetadata,
+} from './storage';
+import { validateQuestionBank, type QuestionBank } from './questionBank';
+import { firebaseAuth, firebaseConfigured, firebaseMissingConfig } from './firebase';
+import { checkCloudManifest, downloadCloudBundle, hashQuestionBank, migrateLocalDataToCloud, syncLinkedDevice } from './cloudSync';
+import {
+  applyStudyEvent,
+  applyStudyEvents,
+  createStudyEvent,
+  decideCloudImport,
+  decideLocalMigration,
+  deduplicateStudyEvents,
+  localDataSignature,
+  validateStudyEvent,
+  type NewStudyEvent,
+  type StudyEvent,
+} from './syncDomain';
 import {
   EMPTY_PROGRESS,
   EMPTY_STATE,
@@ -158,23 +194,22 @@ function multipleChoiceQuizResultLabel(question: MultipleChoiceQuestion, isCorre
   return isCorrect ? '登録された解答と一致しました' : '登録された解答と異なります';
 }
 
-function withRating(progress: QuestionProgress, rating: Rating): QuestionProgress {
-  return {
-    ...progress,
-    rating,
-    nextReviewOn: nextReviewDate(rating),
-    isDifficult: rating === 'weak' ? true : progress.isDifficult,
-  };
-}
-
 function App() {
   const [page, setPage] = useState<Page>('home');
   const [questions, setQuestions] = useState<Question[]>(sampleQuestionList);
-  const [isPrivateQuestionBankLoaded, setIsPrivateQuestionBankLoaded] = useState(false);
+  const [privateQuestionBank, setPrivateQuestionBank] = useState<QuestionBank | null>(null);
   const [studyState, setStudyState] = useState<StudyState>(EMPTY_STATE);
   const [isLoaded, setIsLoaded] = useState(false);
   const [stateCanBeSaved, setStateCanBeSaved] = useState(false);
   const [storageMessage, setStorageMessage] = useState('');
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(!firebaseConfigured);
+  const [deviceId, setDeviceId] = useState('');
+  const [localSyncMetadata, setLocalSyncMetadata] = useState<LocalSyncMetadata | null>(null);
+  const [cloudManifestAvailable, setCloudManifestAvailable] = useState<boolean | null>(null);
+  const [syncMessage, setSyncMessage] = useState('');
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [localBackupSignature, setLocalBackupSignature] = useState<string | null>(null);
   const [questionIndex, setQuestionIndex] = useState(0);
   const [questionNumberFilters, setQuestionNumberFilters] = useState<Partial<Record<LearningPage, string[]>>>({});
   const [answerVisible, setAnswerVisible] = useState(false);
@@ -184,6 +219,17 @@ function App() {
   const memoryRatingRecorded = useRef(false);
   const restoreInput = useRef<HTMLInputElement>(null);
   const questionBankInput = useRef<HTMLInputElement>(null);
+  const stateRef = useRef<StudyState>(EMPTY_STATE);
+  const eventQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const syncInProgressRef = useRef(false);
+  const syncRequestedRef = useRef(false);
+
+  const isPrivateQuestionBankLoaded = privateQuestionBank !== null;
+  const currentLocalSignature = useMemo(
+    () => localDataSignature(privateQuestionBank, studyState),
+    [privateQuestionBank, studyState],
+  );
+  const localBackupIsCurrent = localBackupSignature === currentLocalSignature;
 
   const questionIds = useMemo(() => new Set(questions.map((question) => question.id)), [questions]);
 
@@ -232,11 +278,18 @@ function App() {
         const initialQuestions = savedBank?.questions ?? sampleQuestionList;
         if (active) {
           setQuestions(initialQuestions);
-          setIsPrivateQuestionBankLoaded(savedBank !== null);
+          setPrivateQuestionBank(savedBank);
         }
-        const savedState = await loadStudyState(new Set(initialQuestions.map((question) => question.id)));
+        const [savedState, savedDeviceId, savedSyncMetadata] = await Promise.all([
+          loadStudyState(new Set(initialQuestions.map((question) => question.id))),
+          getOrCreateDeviceId(),
+          loadLocalSyncMetadata(),
+        ]);
         if (active) {
+          stateRef.current = savedState;
           setStudyState(savedState);
+          setDeviceId(savedDeviceId);
+          setLocalSyncMetadata(savedSyncMetadata);
           setStateCanBeSaved(true);
         }
       } catch (error: unknown) {
@@ -252,12 +305,43 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isLoaded || !stateCanBeSaved) return;
-    saveStudyState(studyState).then(
-      () => setStorageMessage((message) => message.startsWith('学習データを保存できません') ? '' : message),
-      (error: unknown) => setStorageMessage(error instanceof Error ? error.message : '学習データを保存できませんでした。'),
-    );
-  }, [isLoaded, stateCanBeSaved, studyState]);
+    if (!firebaseAuth) {
+      setAuthReady(true);
+      return;
+    }
+    return onAuthStateChanged(firebaseAuth, (user) => {
+      setAuthUser(user);
+      setAuthReady(true);
+      if (!user) setCloudManifestAvailable(null);
+    }, (error) => {
+      setAuthReady(true);
+      setSyncMessage(error.message || 'Firebaseの認証状態を確認できませんでした。');
+    });
+  }, []);
+
+  useEffect(() => {
+    if (isLoaded && authReady && authUser) void refreshCloudStatus(authUser);
+  }, [isLoaded, authReady, authUser]);
+
+  useEffect(() => {
+    if (authUser && localSyncMetadata?.userId === authUser.uid && cloudManifestAvailable === true) {
+      void runSync(true);
+    }
+  }, [authUser, localSyncMetadata?.userId, localSyncMetadata?.bankId, localSyncMetadata?.bankHash, cloudManifestAvailable]);
+
+  useEffect(() => {
+    const syncWhenOnline = () => {
+      if (document.visibilityState === 'visible' && authUser && localSyncMetadata?.userId === authUser.uid) {
+        void runSync(true);
+      }
+    };
+    window.addEventListener('online', syncWhenOnline);
+    document.addEventListener('visibilitychange', syncWhenOnline);
+    return () => {
+      window.removeEventListener('online', syncWhenOnline);
+      document.removeEventListener('visibilitychange', syncWhenOnline);
+    };
+  }, [authUser, localSyncMetadata]);
 
   function changePage(nextPage: Page) {
     setPage(nextPage);
@@ -306,85 +390,389 @@ function App() {
     memoryRatingRecorded.current = false;
   }
 
-  function updateProgress(questionId: string, update: (previous: QuestionProgress) => QuestionProgress) {
-    setStudyState((current) => {
-      const previous = progressFor(current, questionId);
-      return {
-        ...current,
-        records: {
-          ...current.records,
-          [questionId]: {
-            ...update(previous),
-            lastStudiedOn: today,
-          },
-        },
-      };
+  function recordStudyEvent(payload: NewStudyEvent | ((current: StudyState) => NewStudyEvent)) {
+    const operation = eventQueueRef.current.then(async () => {
+      if (!deviceId || !stateCanBeSaved) throw new Error('端末情報を準備できていないため、学習記録を保存できません。');
+      const event = createStudyEvent(deviceId, typeof payload === 'function' ? payload(stateRef.current) : payload);
+      const next = applyStudyEvent(stateRef.current, event);
+      await appendStudyEventAndState(event, next);
+      stateRef.current = next;
+      setStudyState(next);
+      setStorageMessage((message) => message.startsWith('学習データを保存できません') ? '' : message);
     });
+    eventQueueRef.current = operation.catch((error: unknown) => {
+      setStorageMessage(error instanceof Error ? error.message : '学習イベントを端末に保存できませんでした。');
+    });
+    void operation.then(
+      () => {
+        if (authUser && localSyncMetadata?.userId === authUser.uid) void runSync(true);
+      },
+      () => undefined,
+    );
   }
 
   function recordFirstStudy(questionId: string) {
     const completedAt = new Date().toISOString();
-    updateProgress(questionId, (previous) => ({
-      ...previous,
-      firstStudyCount: previous.firstStudyCount + 1,
-      firstStudyCompletedAt: previous.firstStudyCompletedAt ?? completedAt,
-    }));
+    recordStudyEvent({ kind: 'first_study', questionId, studiedOn: today, completedAt });
   }
 
   function recordWrittenTest(questionId: string) {
-    updateProgress(questionId, (previous) => ({ ...previous, writtenTestCount: previous.writtenTestCount + 1 }));
+    recordStudyEvent({ kind: 'written_test', questionId, studiedOn: today });
   }
 
   function toggleDifficult(questionId: string) {
-    setStudyState((current) => {
-      const progress = progressFor(current, questionId);
-      return {
-        ...current,
-        records: {
-          ...current.records,
-          [questionId]: { ...progress, isDifficult: !progress.isDifficult },
-        },
-      };
-    });
+    recordStudyEvent((current) => ({
+      kind: 'difficulty_set',
+      questionId,
+      isDifficult: !progressFor(current, questionId).isDifficult,
+    }));
   }
 
   function handleRating(questionId: string, rating: Rating) {
+    const nextReviewOn = nextReviewDate(rating);
     if (page === 'memory') {
       const countTest = !memoryRatingRecorded.current;
       memoryRatingRecorded.current = true;
-      updateProgress(questionId, (previous) => withRating({
-        ...previous,
-        memoryTestCount: previous.memoryTestCount + (countTest ? 1 : 0),
-      }, rating));
+      recordStudyEvent({ kind: 'memory_rating', questionId, studiedOn: today, countTest, rating, nextReviewOn });
       return;
     }
-    updateProgress(questionId, (previous) => withRating(previous, rating));
+    recordStudyEvent({ kind: 'rating', questionId, studiedOn: today, rating, nextReviewOn });
   }
 
-  function downloadBackup() {
+  async function refreshCloudStatus(user: User) {
+    try {
+      const manifest = await checkCloudManifest(user);
+      setCloudManifestAvailable(Boolean(manifest));
+      if (!manifest) {
+        setSyncMessage(localSyncMetadata?.userId === user.uid
+          ? 'この端末は同期済みですが、クラウドの問題バンク情報が見つかりません。データは変更していません。'
+          : 'このGoogleアカウントにクラウドデータはありません。移行元端末から初回移行するか、移行済み端末から取得できます。');
+        return;
+      }
+      if (localSyncMetadata?.userId === user.uid) {
+        setSyncMessage('クラウドデータを確認しました。同期を開始します。');
+      } else if (localSyncMetadata?.userId) {
+        setSyncMessage('この端末は別のGoogleアカウントに紐付いています。バックアップ後、クラウドデータを明示的に取得できます。');
+      } else {
+        setSyncMessage('クラウドデータがあります。端末バックアップを作成してから、問題バンクと学習履歴を取得してください。');
+      }
+    } catch (error) {
+      setCloudManifestAvailable(null);
+      setSyncMessage(error instanceof Error ? error.message : 'クラウドの状態を確認できませんでした。');
+    }
+  }
+
+  async function runSync(quiet = false) {
+    if (syncInProgressRef.current) {
+      syncRequestedRef.current = true;
+      return;
+    }
+    if (!authUser || !deviceId || localSyncMetadata?.userId !== authUser.uid) {
+      if (!quiet) setSyncMessage('このGoogleアカウントに端末が紐付いていません。初回移行またはクラウド取得を行ってください。');
+      return;
+    }
+
+    syncInProgressRef.current = true;
+    setSyncBusy(true);
+    try {
+      await eventQueueRef.current;
+      const snapshot = await loadLocalSyncSnapshot();
+      if (!snapshot.bank) throw new Error('この端末に問題バンクがありません。クラウドから取得してください。');
+      const result = await syncLinkedDevice(authUser, snapshot.bank, localSyncMetadata, snapshot.outbox);
+
+      const commit = eventQueueRef.current.then(async () => {
+        const latestSnapshot = await loadLocalSyncSnapshot();
+        const linkedMetadata = await loadLocalSyncMetadata();
+        const latestIdentity = latestSnapshot.bank ? await hashQuestionBank(latestSnapshot.bank) : null;
+        if (
+          linkedMetadata?.userId !== authUser.uid
+          || !latestIdentity
+          || latestIdentity.bankId !== result.metadata.bankId
+          || latestIdentity.bankHash !== result.metadata.bankHash
+        ) {
+          throw new Error('同期中に端末の連携先または問題バンクが変わりました。クラウド結果で上書きせず、再確認してください。');
+        }
+        const latestOutbox = await loadStudyEventOutbox();
+        const alreadyIncluded = new Set([
+          ...result.metadata.knownEventIds,
+          ...result.stillPendingEvents.map((event) => event.eventId),
+        ]);
+        const eventsCreatedDuringSync = latestOutbox.filter((event) => !alreadyIncluded.has(event.eventId));
+        const mergedState = applyStudyEvents(result.state, eventsCreatedDuringSync);
+        await acknowledgeStudyEvents(result.acknowledgedEventIds);
+        await saveStudyState(mergedState);
+        await saveLocalSyncMetadata(result.metadata);
+        stateRef.current = mergedState;
+        setStudyState(mergedState);
+        setLocalSyncMetadata(result.metadata);
+      });
+      eventQueueRef.current = commit.catch((error: unknown) => {
+        setStorageMessage(error instanceof Error ? error.message : '同期後の端末保存に失敗しました。');
+      });
+      await commit;
+      setCloudManifestAvailable(true);
+      const pendingCount = await loadStudyEventOutbox().then((events) => events.length);
+      const conflicts = result.conflicts.length
+        ? ` 別端末でも同じ問題の評価・苦手設定が変更されています（${result.conflicts.map((conflict) => `${conflict.questionId}:${conflict.field}`).join('、')}）。現在は更新日時順で表示し、履歴自体は保持しています。`
+        : '';
+      setSyncMessage(`同期しました。クラウドに${result.eventCount}件の学習イベント、未送信${pendingCount}件。${conflicts}`);
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : '同期に失敗しました。端末の学習データは保持しています。');
+    } finally {
+      syncInProgressRef.current = false;
+      setSyncBusy(false);
+      if (syncRequestedRef.current) {
+        syncRequestedRef.current = false;
+        queueMicrotask(() => void runSync(true));
+      }
+    }
+  }
+
+  async function signInWithGoogle() {
+    if (!firebaseAuth) return;
+    try {
+      await signInWithPopup(firebaseAuth, new GoogleAuthProvider());
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : 'Googleログインに失敗しました。');
+    }
+  }
+
+  async function signOutFromGoogle() {
+    if (!firebaseAuth) return;
+    try {
+      await signOut(firebaseAuth);
+      setSyncMessage('ログアウトしました。端末内の問題バンクと学習履歴は残っています。');
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : 'ログアウトに失敗しました。');
+    }
+  }
+
+  async function downloadDeviceBackup() {
+    if (!stateCanBeSaved) {
+      setSyncMessage('学習データを読み込めていないため、端末全体のバックアップを作成できません。');
+      return;
+    }
+    try {
+      await eventQueueRef.current;
+      const snapshot = await loadLocalSyncSnapshot();
+      const blob = new Blob([makeDeviceBackup(snapshot.state, snapshot.bank, snapshot.outbox, localSyncMetadata)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `study-device-backup-${today}.json`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setLocalBackupSignature(snapshot.signature);
+      setSyncMessage(`端末全体のバックアップを作成しました（問題バンク${snapshot.bank?.questions.length ?? 0}問・未同期イベント${snapshot.outbox.length}件）。`);
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : '端末全体のバックアップを作成できませんでした。');
+    }
+  }
+
+  async function migrateLocalToCloud() {
+    if (!authUser || !deviceId) return;
+    try {
+      await eventQueueRef.current;
+      const snapshot = await loadLocalSyncSnapshot();
+      const decision = decideLocalMigration({
+        userId: authUser.uid,
+        linkedUserId: localSyncMetadata?.userId ?? null,
+        hasPrivateBank: snapshot.bank !== null,
+        backupIsCurrent: localBackupSignature === snapshot.signature,
+        cloudAlreadyInitialized: cloudManifestAvailable === true,
+      });
+      if (!decision.allowed) {
+        const messages = {
+          private_bank_required: '初回移行には検証済みの非公開問題バンクが必要です。まずスマホで問題JSONを読み込んでください。',
+          backup_required: '移行前に、最新の「問題バンク＋学習履歴」端末バックアップを作成してください。',
+          cloud_exists: 'このGoogleアカウントには既にクラウドデータがあります。上書きせず、取得操作を使ってください。',
+          already_linked: 'この端末はすでにこのGoogleアカウントに同期されています。同期ボタンを使ってください。',
+          different_account: 'この端末は別のGoogleアカウントに紐付いています。先にバックアップしてからクラウド取得を選んでください。',
+        };
+        setSyncMessage(messages[decision.reason]);
+        return;
+      }
+      if (!window.confirm(`この端末の問題バンク（${snapshot.bank?.questions.length ?? 0}問）と現在の学習状態を、このGoogleアカウントの初期データとして保存します。既存のクラウドデータは上書きしません。続けますか？`)) return;
+
+      setSyncBusy(true);
+      const metadata = await migrateLocalDataToCloud(authUser, snapshot.bank!, snapshot.state, deviceId);
+      const link = eventQueueRef.current.then(async () => {
+        const latest = await loadLocalSyncSnapshot();
+        const latestIdentity = latest.bank ? await hashQuestionBank(latest.bank) : null;
+        const baselineIds = new Set(snapshot.outbox.map((event) => event.eventId));
+        const expectedState = applyStudyEvents(snapshot.state, latest.outbox.filter((event) => !baselineIds.has(event.eventId)));
+        if (
+          !latestIdentity
+          || latestIdentity.bankId !== metadata.bankId
+          || latestIdentity.bankHash !== metadata.bankHash
+          || localDataSignature(latest.bank, latest.state) !== localDataSignature(snapshot.bank, expectedState)
+        ) {
+          throw new Error('初回移行中に端末データが変更されたため、この端末を同期済みにしませんでした。クラウドには移行開始時点のスナップショットが作成されている可能性があります。内容を確認し、バックアップ後にクラウドから取得してください。');
+        }
+        await saveMigratedLocalLink(metadata, snapshot.outbox.map((event) => event.eventId));
+      });
+      eventQueueRef.current = link.catch((error: unknown) => {
+        setStorageMessage(error instanceof Error ? error.message : '同期情報を端末に保存できませんでした。');
+      });
+      await link;
+      setLocalSyncMetadata(metadata);
+      setCloudManifestAvailable(true);
+      setSyncMessage('初回移行が完了しました。これ以降の学習イベントは、オンライン時に自動同期されます。');
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : '初回移行に失敗しました。端末データは変更していません。');
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function importCloudToDevice() {
+    if (!authUser) return;
+    try {
+      await eventQueueRef.current;
+      const snapshot = await loadLocalSyncSnapshot();
+      const manifest = await checkCloudManifest(authUser);
+      if (!manifest) {
+        setCloudManifestAvailable(false);
+        setSyncMessage('取得できるクラウドデータがありません。');
+        return;
+      }
+      const localBankId = snapshot.bank ? (await hashQuestionBank(snapshot.bank)).bankId : null;
+      const decision = decideCloudImport({
+        userId: authUser.uid,
+        linkedUserId: localSyncMetadata?.userId ?? null,
+        cloudAvailable: true,
+        backupIsCurrent: localBackupSignature === snapshot.signature,
+        localBankId,
+        cloudBankId: manifest.bankId,
+        hasPendingEvents: snapshot.outbox.length > 0,
+      });
+      if (!decision.allowed) {
+        setSyncMessage(decision.reason === 'backup_required'
+          ? '取得前に、現在端末の問題バンクと学習履歴を含む最新バックアップを作成してください。'
+          : 'この端末はすでにこのGoogleアカウントに同期されています。上書き取得ではなく通常同期を使ってください。');
+        return;
+      }
+
+      const warnings = [
+        '現在端末の問題バンクと学習履歴をクラウドの初回データ＋学習イベントで置き換えます。',
+        decision.replacesDifferentBank ? '問題バンクIDが異なるため、現在の問題バンクはクラウド版に置き換わります。問題バンクは混ぜません。' : '',
+        decision.discardsPendingEvents ? `未同期イベント${snapshot.outbox.length}件も置き換え対象です。直前の端末全体バックアップから回復できます。` : '',
+        'この端末の最新バックアップを作成済みであることを確認してください。続けますか？',
+      ].filter(Boolean).join('\n\n');
+      if (!window.confirm(warnings)) return;
+
+      setSyncBusy(true);
+      const bundle = await downloadCloudBundle(authUser);
+      const importedState = applyStudyEvents(bundle.initialState, bundle.events);
+      const metadata: LocalSyncMetadata = {
+        schemaVersion: 1,
+        userId: authUser.uid,
+        bankId: bundle.manifest.bankId,
+        bankHash: bundle.manifest.bankHash,
+        knownEventIds: bundle.events.map((event) => event.eventId),
+      };
+      const commit = eventQueueRef.current.then(async () => {
+        await replaceLocalCloudData(bundle.bank, importedState, metadata, snapshot.syncSignature);
+        stateRef.current = importedState;
+        setStudyState(importedState);
+        setPrivateQuestionBank(bundle.bank);
+        setQuestions(bundle.bank.questions);
+        setQuestionNumberFilters({});
+        setLocalSyncMetadata(metadata);
+        setLocalBackupSignature(null);
+        setCloudManifestAvailable(true);
+      });
+      eventQueueRef.current = commit.catch((error: unknown) => {
+        setStorageMessage(error instanceof Error ? error.message : 'クラウドデータを端末に保存できませんでした。');
+      });
+      await commit;
+      setSyncMessage(`問題バンク${bundle.bank.questions.length}問と学習イベント${bundle.events.length}件を端末に取得しました。問題バンクを混在させず、IndexedDBに保存しました。`);
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : 'クラウド取得に失敗しました。端末データは変更していません。');
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function downloadBackup() {
     if (!stateCanBeSaved) {
       setStorageMessage('学習データを読み込めていないため、バックアップを作成できません。既存データは変更していません。');
       return;
     }
-    const blob = new Blob([makeBackup(studyState)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `study-backup-${today}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-    setStorageMessage('学習データのバックアップを保存しました。');
+    try {
+      await eventQueueRef.current;
+      const blob = new Blob([makeBackup(stateRef.current)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `study-backup-${today}.json`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setStorageMessage('学習データのバックアップを保存しました。');
+    } catch (error) {
+      setStorageMessage(error instanceof Error ? error.message : 'バックアップを作成できませんでした。');
+    }
   }
 
   async function restoreBackup(file: File | undefined) {
     if (!file) return;
     try {
       const parsed: unknown = JSON.parse((await file.text()).replace(/^\uFEFF/u, ''));
-      const restored = readBackup(parsed, questionIds);
-      if (!window.confirm('現在の学習データをバックアップの内容に置き換えます。続けますか？')) return;
-      await saveStudyState(restored);
-      setStudyState(restored);
-      setStateCanBeSaved(true);
+      const deviceBackup = Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && (parsed as Record<string, unknown>).backupType === 'device-sync-backup-v1');
+      const backupRecord = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+      const restoredBank = deviceBackup
+        ? backupRecord?.questionBank === null ? null : validateQuestionBank(backupRecord?.questionBank)
+        : undefined;
+      let restoredOutbox: StudyEvent[] = [];
+      if (deviceBackup && backupRecord?.outbox !== undefined) {
+        if (!Array.isArray(backupRecord.outbox)) throw new Error('端末バックアップの未同期イベントが不正です。');
+        restoredOutbox = deduplicateStudyEvents(backupRecord.outbox.map(validateStudyEvent));
+      }
+      const restoredSyncMetadata = deviceBackup && backupRecord?.syncMetadata != null
+        ? validateLocalSyncMetadata(backupRecord.syncMetadata)
+        : null;
+      if (restoredSyncMetadata && restoredBank) {
+        const restoredIdentity = await hashQuestionBank(restoredBank);
+        if (restoredIdentity.bankId !== restoredSyncMetadata.bankId || restoredIdentity.bankHash !== restoredSyncMetadata.bankHash) {
+          throw new Error('端末バックアップの問題バンクと同期情報が一致しません。端末データは変更していません。');
+        }
+      }
+      const backupProgress = backupRecord?.progress && typeof backupRecord.progress === 'object'
+        ? backupRecord.progress as Record<string, unknown>
+        : null;
+      const backupRecordIds = backupProgress?.records && typeof backupProgress.records === 'object'
+        ? Object.keys(backupProgress.records as Record<string, unknown>)
+        : [];
+      const restoreQuestionIds = restoredBank
+        ? new Set([...restoredBank.questions.map((question) => question.id), ...(deviceBackup ? backupRecordIds : [])])
+        : deviceBackup ? new Set([...sampleQuestionList.map((question) => question.id), ...backupRecordIds]) : questionIds;
+      const restored = readBackup(parsed, restoreQuestionIds);
+      if (!window.confirm(deviceBackup
+        ? '現在の問題バンク・学習データ・未同期イベントを端末バックアップの内容に置き換えます。バックアップに同期情報があれば再送できる状態に戻します。続けますか？'
+        : '現在の学習データをバックアップの内容に置き換えます。端末のクラウド紐付けと未同期イベントは解除・破棄されます。続けますか？')) return;
+      const restoreOperation = eventQueueRef.current.then(async () => {
+        await restoreLocalStudyData(
+          restored,
+          deviceBackup ? restoredBank : undefined,
+          deviceBackup ? restoredOutbox : [],
+          deviceBackup ? restoredSyncMetadata : null,
+        );
+        stateRef.current = restored;
+        setStudyState(restored);
+        if (deviceBackup) {
+          setPrivateQuestionBank(restoredBank ?? null);
+          setQuestions(restoredBank?.questions ?? sampleQuestionList);
+          setQuestionNumberFilters({});
+        }
+        setLocalSyncMetadata(deviceBackup ? restoredSyncMetadata : null);
+        setLocalBackupSignature(null);
+        setStateCanBeSaved(true);
+      });
+      eventQueueRef.current = restoreOperation.catch((error: unknown) => {
+        setStorageMessage(error instanceof Error ? error.message : 'バックアップからの復元に失敗しました。');
+      });
+      await restoreOperation;
       setStorageMessage('バックアップから学習データを復元しました。');
     } catch (error) {
       setStorageMessage(error instanceof Error ? error.message : 'バックアップを読み込めませんでした。');
@@ -398,13 +786,26 @@ function App() {
     try {
       const parsed: unknown = JSON.parse(await file.text());
       const bank = validateQuestionBank(parsed);
+      if (localSyncMetadata) {
+        const incomingIdentity = await hashQuestionBank(bank);
+        if (incomingIdentity.bankId !== localSyncMetadata.bankId || incomingIdentity.bankHash !== localSyncMetadata.bankHash) {
+          setStorageMessage('この端末はクラウド同期済みのため、別版の問題バンクを読み込めません。同期成功を確認後、右上の「バックアップ」で通常の学習データJSONを保存し、そのJSONを「復元」して連携を解除してから読み込んでください。未同期イベントは先に同期してください。');
+          return;
+        }
+      }
       if (isPrivateQuestionBankLoaded && !window.confirm('保存済みの問題バンクをこのファイルの内容に置き換えます。続けますか？')) return;
 
-      await saveQuestionBank(bank);
-      setQuestions(bank.questions);
-      setQuestionNumberFilters({});
-      setIsPrivateQuestionBankLoaded(true);
-      changePage('home');
+      const importOperation = eventQueueRef.current.then(async () => {
+        await saveQuestionBank(bank);
+        setQuestions(bank.questions);
+        setQuestionNumberFilters({});
+        setPrivateQuestionBank(bank);
+        changePage('home');
+      });
+      eventQueueRef.current = importOperation.catch((error: unknown) => {
+        setStorageMessage(error instanceof Error ? error.message : '問題バンクを保存できませんでした。');
+      });
+      await importOperation;
       setStorageMessage(
         `${bank.questions.length}問の問題バンクを読み込み、ブラウザー内に保存しました。` +
           (stateCanBeSaved ? '' : ' 学習履歴を読み込めていないため、進捗保存は無効のままです。'),
@@ -421,14 +822,11 @@ function App() {
     if (selectedChoice !== null) return;
     const isCorrect = choiceIndex === question.correctChoice;
     setSelectedChoice(choiceIndex);
-    updateProgress(question.id, (previous) => withRating({
-      ...previous,
-      quizTestCount: previous.quizTestCount + 1,
-      quizCorrectCount: previous.quizCorrectCount + (isCorrect ? 1 : 0),
-      quizIncorrectCount: previous.quizIncorrectCount + (isCorrect ? 0 : 1),
-      quizCorrectStreak: isCorrect ? previous.quizCorrectStreak + 1 : 0,
-      lastQuizResult: isCorrect ? 'correct' : 'incorrect',
-    }, isCorrect ? 'good' : 'weak'));
+    const rating: Rating = isCorrect ? 'good' : 'weak';
+    recordStudyEvent({
+      kind: 'quiz_answer', questionId: question.id, studiedOn: today,
+      correct: isCorrect, rating, nextReviewOn: nextReviewDate(rating),
+    });
   }
 
   function renderQuestionCard(question: Question, compact = false) {
@@ -633,6 +1031,45 @@ function App() {
     return difficultQuestions.length ? <div className="difficult-list">{difficultQuestions.map((question) => renderQuestionCard(question, true))}</div> : <section className="empty-state"><span className="empty-state__icon">☆</span><h2>苦手問題はまだありません</h2><p>問題カードの「苦手に追加」または暗記確認の「×」から登録できます。</p><button className="button button--primary" onClick={() => changePage('memory')}>暗記確認をはじめる →</button></section>;
   }
 
+  function renderSyncPanel() {
+    const isLinkedToAccount = Boolean(authUser && localSyncMetadata?.userId === authUser.uid);
+    const canUseLocalData = isLoaded && stateCanBeSaved && !syncBusy;
+    return (
+      <section className="sync-panel" aria-labelledby="sync-panel-title">
+        <div className="sync-panel__heading">
+          <div><span className="eyebrow">CROSS-DEVICE STUDY</span><h2 id="sync-panel-title">スマホ・PC間の学習同期</h2></div>
+          <span className={`sync-status${isLinkedToAccount ? ' sync-status--linked' : ''}`}><i />{!firebaseConfigured ? 'ローカル保存' : isLinkedToAccount ? 'アカウント連携済み' : '未連携'}</span>
+        </div>
+        <p className="sync-panel__intro">問題バンクと学習履歴は通常この端末のIndexedDBに保存されます。Googleアカウントを連携すると、非公開問題バンクはFirebase Storageへ、学習イベントはFirestoreへユーザー専用データとして同期します。オフライン中もこの端末で学習できます。</p>
+        {!firebaseConfigured ? (
+          <div className="sync-panel__notice" role="status">
+            <strong>クラウド同期は未設定です</strong>
+            <span>Firebase設定がないため、現在はサンプル問題・ローカル保存で動作しています。.envまたはGitHub Actions Variablesに設定してください（不足: {firebaseMissingConfig.join(', ')}）。</span>
+          </div>
+        ) : !authReady ? (
+          <div className="sync-panel__notice">Firebaseの認証状態を確認しています…</div>
+        ) : !authUser ? (
+          <div className="sync-panel__actions"><button className="button button--primary" onClick={() => void signInWithGoogle()} disabled={!canUseLocalData}>Googleでログイン</button><span className="muted-small">ログインだけではデータをアップロードしません。初回移行・取得はバックアップ後の明示操作です。</span></div>
+        ) : (
+          <>
+            <div className="sync-panel__account"><span><strong>{authUser.displayName || 'Googleアカウント'}</strong><small>{authUser.email || authUser.uid}</small></span><button className="text-button" onClick={() => void signOutFromGoogle()} disabled={syncBusy}>ログアウト</button></div>
+            <div className="sync-panel__actions">
+              <button className="button button--outline" onClick={() => void downloadDeviceBackup()} disabled={!canUseLocalData}>{localBackupIsCurrent ? '最新バックアップを再作成' : '端末全体をバックアップ'}</button>
+              {isLinkedToAccount && cloudManifestAvailable && <button className="button button--primary" onClick={() => void runSync()} disabled={!canUseLocalData}>{syncBusy ? '同期中…' : '今すぐ同期'}</button>}
+              {!isLinkedToAccount && cloudManifestAvailable && <button className="button button--primary" onClick={() => void importCloudToDevice()} disabled={!canUseLocalData || !localBackupIsCurrent}>{syncBusy ? '取得中…' : 'クラウドからこの端末へ取得'}</button>}
+              {!isLinkedToAccount && cloudManifestAvailable === false && <button className="button button--primary" onClick={() => void migrateLocalToCloud()} disabled={!canUseLocalData || !localBackupIsCurrent || !privateQuestionBank}>{syncBusy ? '初回移行中…' : 'この端末から初回移行'}</button>}
+              {cloudManifestAvailable === null && <button className="button button--outline" onClick={() => void refreshCloudStatus(authUser)} disabled={syncBusy}>クラウド状態を確認</button>}
+              {isLinkedToAccount && !cloudManifestAvailable && <button className="button button--outline" onClick={() => void refreshCloudStatus(authUser)} disabled={syncBusy}>クラウドを再確認</button>}
+            </div>
+            {localBackupIsCurrent && <p className="sync-panel__backup-note">現在の問題バンクと学習状態を含むバックアップを作成済みです。データ変更後は再作成が必要です。</p>}
+          </>
+        )}
+        {syncMessage && <p className="sync-panel__message" role="status">{syncBusy && <span className="sync-panel__spinner" aria-hidden="true" />} {syncMessage}</p>}
+        <p className="sync-panel__privacy">教材データをクラウドに置く場合は、教材の利用許諾・個人情報・共有端末の扱いを事前に確認してください。同期失敗時は端末内データを上書きしません。</p>
+      </section>
+    );
+  }
+
   function renderQuestionNumberFilter() {
     return (
       <section className="question-filter" aria-label="問題番号フィルター">
@@ -693,6 +1130,7 @@ function App() {
         <header className="topbar"><div><span className="topbar__breadcrumb">学習室 <span>/</span> {currentTitle.title}</span><h1>{currentTitle.title}</h1></div><div className="topbar__actions"><button className="button button--quiet" onClick={() => questionBankInput.current?.click()} disabled={!isLoaded}><span>＋</span> 問題読込</button><input ref={questionBankInput} type="file" accept="application/json,.json" hidden onChange={(event) => void importQuestionBank(event.target.files?.[0])} /><button className="button button--quiet" onClick={downloadBackup}><span>↓</span> バックアップ</button><button className="button button--quiet" onClick={() => restoreInput.current?.click()}><span>↥</span> 復元</button><input ref={restoreInput} type="file" accept="application/json,.json" hidden onChange={(event) => void restoreBackup(event.target.files?.[0])} /></div></header>
         <div className="content-wrap">
           {storageMessage && <div className={`storage-banner${storageMessage.includes('できません') || storageMessage.includes('利用できません') || storageMessage.includes('読み込めません') ? ' storage-banner--error' : ''}`} role="status">{storageMessage}<button onClick={() => setStorageMessage('')} aria-label="閉じる">×</button></div>}
+          {renderSyncPanel()}
           <div className="page-lead"><p>{currentTitle.subtitle}</p><span className="sample-disclaimer"><span>!</span> {isPrivateQuestionBankLoaded ? `非公開の問題バンクを使用中です（${questions.length}問・このブラウザーに保存）。` : 'sample/AI作成練習問題です。公式過去問・教材の実データではありません。'}</span></div>
           {!isLoaded && <div className="loading-card">学習データを読み込んでいます…</div>}
           {isLoaded && page === 'home' && renderHome()}
