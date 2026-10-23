@@ -24,6 +24,7 @@ import {
   type LocalSyncMetadata,
 } from './storage';
 import { validateQuestionBank, type QuestionBank } from './questionBank';
+import { formatExamCountdown } from './examCountdown';
 import { firebaseAuth, firebaseConfigured, firebaseMissingConfig } from './firebase';
 import { checkCloudManifest, downloadCloudBundle, hashQuestionBank, migrateLocalDataToCloud, syncLinkedDevice } from './cloudSync';
 import {
@@ -87,6 +88,23 @@ function localDateKey(date = new Date()): string {
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+function useExamCountdown(): string {
+  const [today, setToday] = useState(() => new Date());
+
+  useEffect(() => {
+    const now = new Date();
+    const nextLocalMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    const timeoutId = window.setTimeout(
+      () => setToday(new Date()),
+      nextLocalMidnight.getTime() - now.getTime(),
+    );
+
+    return () => window.clearTimeout(timeoutId);
+  }, [today]);
+
+  return formatExamCountdown(today);
 }
 
 function formatDate(date = new Date()): string {
@@ -1115,6 +1133,7 @@ function App() {
   }
 
   const currentTitle = pageTitles[page];
+  const examCountdown = useExamCountdown();
 
   return (
     <div className="app-shell">
@@ -1127,7 +1146,7 @@ function App() {
       </aside>
 
       <main className="main-area">
-        <header className="topbar"><div><span className="topbar__breadcrumb">学習室 <span>/</span> {currentTitle.title}</span><h1>{currentTitle.title}</h1></div><div className="topbar__actions"><button className="button button--quiet" onClick={() => questionBankInput.current?.click()} disabled={!isLoaded}><span>＋</span> 問題読込</button><input ref={questionBankInput} type="file" accept="application/json,.json" hidden onChange={(event) => void importQuestionBank(event.target.files?.[0])} /><button className="button button--quiet" onClick={downloadBackup}><span>↓</span> バックアップ</button><button className="button button--quiet" onClick={() => restoreInput.current?.click()}><span>↥</span> 復元</button><input ref={restoreInput} type="file" accept="application/json,.json" hidden onChange={(event) => void restoreBackup(event.target.files?.[0])} /></div></header>
+        <header className="topbar"><div className="topbar__heading"><div><span className="topbar__breadcrumb">学習室 <span>/</span> {currentTitle.title}</span><h1>{currentTitle.title}</h1></div><span className="exam-countdown" role="status" aria-live="polite">{examCountdown}</span></div><div className="topbar__actions"><button className="button button--quiet" onClick={() => questionBankInput.current?.click()} disabled={!isLoaded}><span>＋</span> 問題読込</button><input ref={questionBankInput} type="file" accept="application/json,.json" hidden onChange={(event) => void importQuestionBank(event.target.files?.[0])} /><button className="button button--quiet" onClick={downloadBackup}><span>↓</span> バックアップ</button><button className="button button--quiet" onClick={() => restoreInput.current?.click()}><span>↥</span> 復元</button><input ref={restoreInput} type="file" accept="application/json,.json" hidden onChange={(event) => void restoreBackup(event.target.files?.[0])} /></div></header>
         <div className="content-wrap">
           {storageMessage && <div className={`storage-banner${storageMessage.includes('できません') || storageMessage.includes('利用できません') || storageMessage.includes('読み込めません') ? ' storage-banner--error' : ''}`} role="status">{storageMessage}<button onClick={() => setStorageMessage('')} aria-label="閉じる">×</button></div>}
           {renderSyncPanel()}
